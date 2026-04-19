@@ -47,9 +47,12 @@ async def debug_ml():
 
 @app.get("/models/status")
 async def model_status():
-    from app.inference.predictor import Predictor
-    predictor = Predictor()
-    return predictor.get_model_health()
+    try:
+        from app.inference.predictor import Predictor
+        predictor = Predictor()
+        return predictor.get_model_health()
+    except ImportError:
+        return {"status": "ML_UNAVAILABLE", "message": "ML packages not installed"}
 
 
 def start_grpc():

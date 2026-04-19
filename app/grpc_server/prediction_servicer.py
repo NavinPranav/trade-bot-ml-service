@@ -9,20 +9,41 @@ from loguru import logger
 from app.config import settings
 from app.grpc_server.proto_market import ohlcv_bars_to_dataframe, vix_points_to_dataframe
 from app.grpc_server.live_tick_buffer import get_live_tick_buffer, live_tick_routing_key
-from app.inference.predictor import Predictor
 from app.inference.gemini_predictor import GeminiPredictor
-from app.backtesting.backtest_engine import BacktestEngine
 
 _predict_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-predict")
+
+_ML_UNAVAILABLE_MSG = (
+    "ML prediction pipeline is not available (ML packages not installed). "
+    "Use GetGeminiPrediction for AI-based predictions."
+)
+
+
+def _try_import_predictor():
+    try:
+        from app.inference.predictor import Predictor
+        return Predictor()
+    except ImportError:
+        logger.warning("ML Predictor unavailable (missing packages)")
+        return None
+
+
+def _try_import_backtest():
+    try:
+        from app.backtesting.backtest_engine import BacktestEngine
+        return BacktestEngine()
+    except ImportError:
+        logger.warning("BacktestEngine unavailable (missing packages)")
+        return None
 
 
 class PredictionServicer:
     """Implements the PredictionService gRPC interface."""
 
     def __init__(self):
-        self.predictor = Predictor()
+        self.predictor = _try_import_predictor()
         self.gemini_predictor = GeminiPredictor()
-        self.backtest_engine = BacktestEngine()
+        self.backtest_engine = _try_import_backtest()
 
     def _build_response(self, pb2, horizon: str, result: dict):
         """Build a PredictionResponse proto from a result dict."""
@@ -39,6 +60,8 @@ class PredictionServicer:
 
     async def GetPrediction(self, request, context):
         from app.grpc_server.generated import prediction_service_pb2 as pb2
+        if self.predictor is None:
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, _ML_UNAVAILABLE_MSG)
         return await self._do_prediction(request, context, pb2, engine="ML")
 
     async def GetGeminiPrediction(self, request, context):
@@ -128,6 +151,9 @@ class PredictionServicer:
     async def GetVolatilityForecast(self, request, context):
         from app.grpc_server.generated import prediction_service_pb2 as pb2
 
+        if self.predictor is None:
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, _ML_UNAVAILABLE_MSG)
+
         min_bars = settings.min_ohlcv_bars_grpc
         if len(request.sensex_ohlcv) < min_bars:
             await context.abort(
@@ -162,6 +188,8 @@ class PredictionServicer:
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def RunBacktest(self, request, context):
+        if self.backtest_engine is None:
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, _ML_UNAVAILABLE_MSG)
         try:
             from app.grpc_server.generated import prediction_service_pb2 as pb2
 
@@ -184,6 +212,8 @@ class PredictionServicer:
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def GetFeatureImportance(self, request, context):
+        if self.predictor is None:
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, _ML_UNAVAILABLE_MSG)
         try:
             from app.grpc_server.generated import prediction_service_pb2 as pb2
 
@@ -199,6 +229,8 @@ class PredictionServicer:
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def GetModelHealth(self, request, context):
+        if self.predictor is None:
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, _ML_UNAVAILABLE_MSG)
         try:
             from app.grpc_server.generated import prediction_service_pb2 as pb2
 

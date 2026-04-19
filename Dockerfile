@@ -19,6 +19,6 @@ RUN python -m grpc_tools.protoc \
     && sed -i 's/^import prediction_service_pb2 as/from . import prediction_service_pb2 as/' \
         ./app/grpc_server/generated/prediction_service_pb2_grpc.py
 
-EXPOSE 50051 8000
+EXPOSE 50051 8081
 
 CMD ["python", "-m", "app.main"]
