@@ -1,7 +1,12 @@
 """
 Main entry point — starts both FastAPI (health/admin) and gRPC server.
+
+On Render (or any single-port host), gRPC is the primary service on the
+externally-routed port (GRPC_PORT / PORT).  FastAPI runs on a secondary
+internal port (HTTP_PORT, default 8081) for health-checks and debugging.
 """
 import asyncio
+import os
 import threading
 
 import uvicorn
@@ -15,20 +20,20 @@ from app.data.storage.db import engine, Base
 
 configure_logging(settings.log_level)
 
+RENDER_PORT = int(os.environ.get("PORT", "0"))
+GRPC_PORT = RENDER_PORT if RENDER_PORT else settings.grpc_port
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8081" if RENDER_PORT else "8000"))
+
 app = FastAPI(title="Sensex ML Service", version="0.1.0")
 
 
+@app.get("/")
 @app.get("/health")
 async def health():
     return {
         "status": "healthy",
-        "grpc_listen_port": settings.grpc_port,
-        "http_listen_port": 8000,
-        "grpc_note": (
-            "Use gRPC (plaintext or matching TLS) on grpc_listen_port. "
-            "Port 8000 is HTTP/FastAPI only; pointing a gRPC client at 8000 causes protobuf DecodeError."
-        ),
-        "debug_hint": "GET /debug/ml for gRPC prediction counters (if GetPrediction is never called, counters stay 0).",
+        "grpc_listen_port": GRPC_PORT,
+        "http_listen_port": HTTP_PORT,
     }
 
 
@@ -49,16 +54,15 @@ async def model_status():
 
 def start_grpc():
     """Run gRPC server in a background thread."""
-    logger.info(f"Starting gRPC server on port {settings.grpc_port}")
-    asyncio.run(serve_grpc())
+    logger.info(f"Starting gRPC server on port {GRPC_PORT}")
+    asyncio.run(serve_grpc(GRPC_PORT))
 
 
 if __name__ == "__main__":
     logger.info("Sensex ML Service starting...")
+    logger.info(f"gRPC port: {GRPC_PORT}, HTTP port: {HTTP_PORT}")
 
-    # Start gRPC in background thread
     grpc_thread = threading.Thread(target=start_grpc, daemon=True)
     grpc_thread.start()
 
-    # Start FastAPI (health checks + admin)
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=HTTP_PORT, log_level="info")

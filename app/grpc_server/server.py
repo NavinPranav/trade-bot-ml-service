@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import grpc
 from concurrent import futures
 from loguru import logger
@@ -8,11 +10,10 @@ from app.logging_setup import configure_logging
 from app.grpc_server.prediction_servicer import PredictionServicer
 
 
-async def serve_grpc():
+async def serve_grpc(port: int | None = None):
     configure_logging(settings.log_level)
     server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
 
-    # Import generated code (run protoc first)
     try:
         from app.grpc_server.generated import prediction_service_pb2_grpc
         prediction_service_pb2_grpc.add_PredictionServiceServicer_to_server(
@@ -23,7 +24,8 @@ async def serve_grpc():
         set_grpc_listen("", False)
         return
 
-    listen_addr = f"[::]:{settings.grpc_port}"
+    grpc_port = port if port is not None else settings.grpc_port
+    listen_addr = f"[::]:{grpc_port}"
     server.add_insecure_port(listen_addr)
     set_grpc_listen(listen_addr, True)
     logger.info(f"gRPC server listening on {listen_addr}")
