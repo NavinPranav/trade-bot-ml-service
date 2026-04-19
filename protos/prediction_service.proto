@@ -1,0 +1,138 @@
+syntax = "proto3";
+package sensex.ml;
+
+// Keep field numbers and message shapes aligned with sensex-option-trader's prediction_service.proto
+// where shared. When adding RPCs, regenerate stubs and update the Java service to call the new method.
+
+service PredictionService {
+  // Classical ML ensemble (backend chooses this vs GetGeminiPrediction based on its own config).
+  rpc GetPrediction (PredictionRequest) returns (PredictionResponse);
+  // Google Gemini — same request/response shape; backend calls this when AI path is selected.
+  rpc GetGeminiPrediction (PredictionRequest) returns (PredictionResponse);
+  rpc GetVolatilityForecast (VolatilityRequest) returns (VolatilityResponse);
+  rpc RunBacktest (BacktestRequest) returns (stream BacktestProgress);
+  rpc GetFeatureImportance (Empty) returns (FeatureImportanceResponse);
+  rpc GetModelHealth (Empty) returns (ModelHealthResponse);
+  // Java backend streams real-time ticks; ML service ingests (no direct broker calls).
+  rpc StreamLiveTicks (stream LiveTick) returns (StreamAck);
+}
+
+message Empty {}
+
+// OHLCV bar for the instrument named in PredictionRequest.underlying_symbol (equity or index).
+// timestamp_unix_ms is bar time in epoch ms (UTC). Backend may send intraday stream or daily bars; the ML
+// service aggregates to one row per calendar day in Asia/Kolkata for indicators.
+// CRITICAL: open/high/low/close MUST be protobuf "double" (Java double), not float.
+// volume MUST be int64 (Java long) — double vs int64 on field 6 will cause DecodeError on the peer.
+message OhlcvBar {
+  int64 timestamp_unix_ms = 1;
+  double open = 2;
+  double high = 3;
+  double low = 4;
+  double close = 5;
+  int64 volume = 6;
+}
+
+// India VIX sample aligned to trading days (same convention as OHLCV timestamps).
+message VixPoint {
+  int64 timestamp_unix_ms = 1;
+  double vix = 2;
+}
+
+// Optional last trade / snapshot from your market backend (otherwise last OHLCV close is used).
+message SensexQuote {
+  double price = 1;
+  double change = 2;
+  double change_pct = 3;
+}
+
+message PredictionRequest {
+  string horizon = 1;
+  // Historical daily bars for underlying_symbol (name is legacy; not limited to Sensex).
+  repeated OhlcvBar sensex_ohlcv = 2;
+  // Optional; if empty the ML service derives a VIX proxy from OHLCV (prefer sending points from backend).
+  repeated VixPoint india_vix = 3;
+  // Plain submessage (not "optional") for broader Java/protoc compatibility; omit fields or send zeros if unused.
+  SensexQuote sensex_quote = 4;
+  // e.g. RELIANCE.BSE — must match backend field number if you rename in Java (wire uses numbers only).
+  string underlying_symbol = 5;
+  // Angel One instrument token (string, e.g. "26009") — send same value as LiveTick.token to match stream ticks.
+  string instrument_token = 6;
+}
+
+message PredictionResponse {
+  string prediction_date = 1;
+  string horizon = 2;
+  // GetPrediction (ML): BULLISH | BEARISH | NEUTRAL. GetGeminiPrediction: BUY | HOLD | SELL (options stance).
+  string direction = 3;
+  double magnitude = 4;
+  double confidence = 5;
+  double predicted_volatility = 6;
+  double current_sensex = 7;
+  double target_sensex = 8;
+}
+
+message VolatilityRequest {
+  int32 days_ahead = 1;
+  repeated OhlcvBar sensex_ohlcv = 2;
+  string underlying_symbol = 3;
+}
+
+message VolatilityResponse {
+  double predicted_rv = 1;
+  double current_iv = 2;
+  double iv_percentile = 3;
+  string signal = 4;
+}
+
+message BacktestRequest {
+  string strategy_type = 1;
+  string start_date = 2;
+  string end_date = 3;
+  string parameters_json = 4;
+}
+
+message BacktestProgress {
+  int32 progress_percent = 1;
+  string status = 2;
+  string result_json = 3;
+}
+
+message FeatureImportanceResponse {
+  repeated FeatureScore features = 1;
+}
+
+message FeatureScore {
+  string feature_name = 1;
+  double importance = 2;
+}
+
+message ModelHealthResponse {
+  string model_version = 1;
+  string last_trained = 2;
+  double recent_accuracy = 3;
+  int32 predictions_today = 4;
+  string status = 5;
+}
+
+// Real-time tick from Angel One SmartAPI WebSocket stream.
+// MUST be byte-for-byte identical to the Java repo's LiveTick (field numbers + types).
+message LiveTick {
+  string symbol = 1;
+  int32 exchange_type = 2;
+  string token = 3;
+  double last_traded_price = 4;
+  double open = 5;
+  double high = 6;
+  double low = 7;
+  double close = 8;
+  double change = 9;
+  double change_pct = 10;
+  int64 volume = 11;
+  int64 timestamp_unix_ms = 12;
+}
+
+message StreamAck {
+  bool accepted = 1;
+  string message = 2;
+}

@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+models/*
+!models/.gitkeep
+# Generated training CSVs / manifest (run scripts/prepare_training_data.py)
+data/training/*
+!data/training/.gitkeep
+.venv/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+notebooks/.ipynb_checkpoints/
+mlruns/
