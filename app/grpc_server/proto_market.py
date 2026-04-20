@@ -38,20 +38,30 @@ def _daily_ohlcv_from_intraday(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _attr_or_key(obj, name):
+    """Read a field from either a proto message (attribute) or a plain dict (key)."""
+    if isinstance(obj, dict):
+        return obj[name]
+    return getattr(obj, name)
+
+
 def ohlcv_bars_to_dataframe(bars) -> pd.DataFrame:
-    """Convert repeated OhlcvBar to a daily OHLCV frame (intraday bars aggregated per day)."""
+    """Convert repeated OhlcvBar to a daily OHLCV frame (intraday bars aggregated per day).
+
+    Accepts proto OhlcvBar objects or plain dicts with the same keys.
+    """
     if not bars:
         return pd.DataFrame()
 
-    ts = [int(b.timestamp_unix_ms) for b in bars]
+    ts = [int(_attr_or_key(b, "timestamp_unix_ms")) for b in bars]
     idx = _timestamps_to_ist(ts)
     df = pd.DataFrame(
         {
-            "open": [float(b.open) for b in bars],
-            "high": [float(b.high) for b in bars],
-            "low": [float(b.low) for b in bars],
-            "close": [float(b.close) for b in bars],
-            "volume": [float(int(b.volume)) for b in bars],
+            "open": [float(_attr_or_key(b, "open")) for b in bars],
+            "high": [float(_attr_or_key(b, "high")) for b in bars],
+            "low": [float(_attr_or_key(b, "low")) for b in bars],
+            "close": [float(_attr_or_key(b, "close")) for b in bars],
+            "volume": [float(int(_attr_or_key(b, "volume"))) for b in bars],
         },
         index=idx,
     )
@@ -67,12 +77,13 @@ def ohlcv_bars_to_dataframe(bars) -> pd.DataFrame:
 
 
 def vix_points_to_dataframe(points) -> pd.DataFrame:
+    """Accepts proto VixPoint objects or plain dicts with the same keys."""
     if not points:
         return pd.DataFrame()
 
-    ts = [int(p.timestamp_unix_ms) for p in points]
+    ts = [int(_attr_or_key(p, "timestamp_unix_ms")) for p in points]
     idx = _timestamps_to_ist(ts)
-    df = pd.DataFrame({"vix": [float(p.vix) for p in points]}, index=idx)
+    df = pd.DataFrame({"vix": [float(_attr_or_key(p, "vix")) for p in points]}, index=idx)
     df.index.name = "timestamp"
     df = df.sort_index()
     if df.index.duplicated().any():
