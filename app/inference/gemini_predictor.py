@@ -112,6 +112,13 @@ def _normalize_option_signal(raw: dict[str, Any]) -> str:
     return "HOLD"
 
 
+_GEMINI_QUOTA_USER_NOTICE = (
+    "Google Gemini rate limit or daily quota was reached, so the AI could not run. "
+    "The signal below is a neutral placeholder (HOLD), not a model forecast. "
+    "Try again later or check billing/plan limits: https://ai.google.dev/gemini-api/docs/rate-limits"
+)
+
+
 def _coerce_result(raw: dict[str, Any], realtime_price: float) -> Dict[str, Any]:
     direction = _normalize_option_signal(raw)
     try:
@@ -134,7 +141,7 @@ def _coerce_result(raw: dict[str, Any], realtime_price: float) -> Dict[str, Any]
     if current_sensex and magnitude:
         target_sensex = round(current_sensex * (1 + magnitude / 100), 2)
 
-    return {
+    out: Dict[str, Any] = {
         "direction": direction,
         "magnitude": round(magnitude, 4),
         "confidence": round(confidence, 2),
@@ -142,6 +149,10 @@ def _coerce_result(raw: dict[str, Any], realtime_price: float) -> Dict[str, Any]
         "current_sensex": current_sensex,
         "target_sensex": target_sensex,
     }
+    notice = raw.get("ai_quota_notice")
+    if notice:
+        out["ai_quota_notice"] = str(notice).strip()[:4000]
+    return out
 
 
 def _gemini_text_from_response(data: dict[str, Any]) -> str:
@@ -230,6 +241,24 @@ class GeminiPredictor:
                     "generationConfig": {"temperature": 0.2},
                 }
                 resp = client.post(url, headers=headers, json=body_plain)
+            # Free-tier / billing quota and per-minute rate limits (RESOURCE_EXHAUSTED → HTTP 429)
+            if resp.status_code == 429:
+                detail = (resp.text or "")[:1024]
+                logger.warning(
+                    "Gemini quota or rate limit (HTTP 429) model={!r} — returning HOLD fallback so callers stay up. {}",
+                    model,
+                    detail,
+                )
+                return _coerce_result(
+                    {
+                        "direction": "HOLD",
+                        "magnitude": 0.0,
+                        "confidence": 0.0,
+                        "predicted_volatility": 0.0,
+                        "ai_quota_notice": _GEMINI_QUOTA_USER_NOTICE,
+                    },
+                    float(realtime["price"]),
+                )
             if resp.status_code >= 400:
                 detail = (resp.text or "")[:2048]
                 logger.error(

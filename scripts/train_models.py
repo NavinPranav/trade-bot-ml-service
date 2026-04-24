@@ -30,6 +30,9 @@ def main() -> None:
 
     trainer = ModelTrainer()
     results = trainer.train_from_prepared(args.data_dir)
+    if results.get("disabled"):
+        logger.warning(results)
+        raise SystemExit(0)
     if results.get("error"):
         logger.error(results)
         raise SystemExit(1)

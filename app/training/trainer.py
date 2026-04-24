@@ -1,5 +1,8 @@
 """
 Model training orchestrator — trains all models in sequence.
+
+ML training is disabled (ML_TRAINING_ACTIVE=False). Re-enable from git history
+or set the flag True after installing statistical + ML packages.
 """
 from pathlib import Path
 from typing import Dict, Optional
@@ -7,63 +10,24 @@ from typing import Dict, Optional
 import pandas as pd
 from loguru import logger
 
-from app.config import settings
-from app.features.feature_pipeline import FeaturePipeline
 from app.training.prepared_data import DEFAULT_DATA_DIR, load_training_bundle
-from app.models.statistical.garch_model import GARCHModel
-from app.models.statistical.arima_model import ARIMAModel
-from app.models.classical_ml.xgboost_model import XGBoostDirectionModel
-from app.models.classical_ml.lightgbm_model import LightGBMMagnitudeModel
+
+ML_TRAINING_ACTIVE = False
 
 
 class ModelTrainer:
 
     def __init__(self):
-        self.model_dir = settings.model_dir
-        self.feature_pipeline = FeaturePipeline()
-        self.feature_cols = self.feature_pipeline.get_feature_columns()
+        logger.warning("ModelTrainer: ML training pipeline is disabled (ML_TRAINING_ACTIVE=False)")
 
     def train_all(self, ohlcv: pd.DataFrame, vix: pd.DataFrame) -> Dict[str, Dict]:
-        logger.info("Starting full model training pipeline...")
-
-        df = self.feature_pipeline.build(ohlcv, vix=vix)
-
-        if df.empty:
-            logger.error("No data available for training")
-            return {"error": "no data"}
-
-        results = {}
-
-        # 1. GARCH (Statistical)
-        logger.info("Training GARCH...")
-        garch = GARCHModel(self.model_dir)
-        results["garch"] = garch.train(df)
-        garch.save()
-
-        # 2. ARIMA (Statistical)
-        logger.info("Training ARIMA...")
-        arima = ARIMAModel(self.model_dir)
-        results["arima"] = arima.train(df)
-        arima.save()
-
-        # 3. XGBoost (Classical ML)
-        logger.info("Training XGBoost...")
-        xgb = XGBoostDirectionModel(self.model_dir, self.feature_cols)
-        results["xgboost"] = xgb.train(df)
-        xgb.save()
-
-        # 4. LightGBM (Classical ML)
-        logger.info("Training LightGBM...")
-        lgb = LightGBMMagnitudeModel(self.model_dir, self.feature_cols)
-        results["lightgbm"] = lgb.train(df)
-        lgb.save()
-
-        # 5. LSTM (Deep Learning) — stub
-        logger.info("LSTM training: stub (implement full pipeline)")
-        results["lstm"] = {"status": "stub"}
-
-        logger.info(f"Training complete. Results: {results}")
-        return results
+        # Previously: FeaturePipeline.build → GARCHModel / ARIMAModel / XGBoostDirectionModel /
+        # LightGBMMagnitudeModel train+save, LSTM stub. Restore from git when ML_TRAINING_ACTIVE.
+        logger.warning("train_all skipped: ML training disabled")
+        return {
+            "disabled": True,
+            "message": "ML training is turned off (see ML_TRAINING_ACTIVE in app/training/trainer.py)",
+        }
 
     def train_from_prepared(self, data_dir: Optional[Path] = None) -> Dict[str, Dict]:
         """Load `data/training/*.csv` from prepare_training_data.py and run train_all."""

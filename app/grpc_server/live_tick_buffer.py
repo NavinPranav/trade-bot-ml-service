@@ -2,12 +2,17 @@
 Buffer for real-time ticks streamed from the Java backend.
 
 Responsibilities:
-  - Stores the latest tick per instrument (by symbol).
+  - Stores the latest tick per instrument (by symbol or token key).
   - Maintains a copy of the most recent OHLCV baseline from GetPrediction.
   - Merges live ticks into the last OHLCV bar (updates close/high/low/volume)
     so the predictor sees the freshest data.
   - Provides debounce-aware dirty tracking so StreamLiveTicks can trigger
     re-prediction only when enough time has passed since the last run.
+
+Angel One may stream many instruments (each user's underlying, INDIA VIX, etc.).
+Live re-prediction must only run for ticks that match the baseline underlying
+from the last GetGeminiPrediction / GetPrediction — otherwise "current" price
+would jump between unrelated instruments.
 """
 from __future__ import annotations
 
@@ -23,10 +28,10 @@ from app.config import settings
 
 
 def live_tick_routing_key(tick) -> str:
-    """Stable key for buffer dict: prefer symbol, else token (matches Java LiveTick)."""
+    """Stable key for stream routing: prefer symbol, else token (matches Java LiveTick)."""
     sym = (getattr(tick, "symbol", "") or "").strip()
     tok = (getattr(tick, "token", "") or "").strip()
-    return sym or tok
+    return (sym or tok).upper()
 
 
 @dataclass
@@ -55,6 +60,8 @@ class LiveTickBuffer:
         self._baseline_vix: Optional[pd.DataFrame] = None
         self._baseline_horizon: str = ""
         self._baseline_engine: str = "ML"
+        self._baseline_underlying: str = ""
+        self._baseline_instrument_token: str = ""
         self._last_prediction_time: float = 0.0
         self._last_prediction_result: Optional[Dict[str, Any]] = None
         self._dirty = False
@@ -79,11 +86,13 @@ class LiveTickBuffer:
         chg_pct = float(getattr(tick, "change_pct", 0.0) or 0.0)
         vol = int(getattr(tick, "volume", 0) or 0)
         ts_ms = int(getattr(tick, "timestamp_unix_ms", 0) or 0)
+        sym_raw = (getattr(tick, "symbol", "") or "").strip()
+        tok_raw = (getattr(tick, "token", "") or "").strip()
 
         snap = TickSnapshot(
-            symbol=key,
+            symbol=sym_raw or key,
             exchange_type=int(getattr(tick, "exchange_type", 0) or 0),
-            token=(getattr(tick, "token", "") or ""),
+            token=tok_raw,
             ltp=ltp,
             open=open_p,
             high=high_p,
@@ -94,13 +103,22 @@ class LiveTickBuffer:
             volume=vol,
             timestamp_ms=ts_ms,
         )
+        keys: set[str] = {key}
+        tok_u = tok_raw.upper()
+        sym_u = sym_raw.upper()
+        if tok_u:
+            keys.add(tok_u)
+        if sym_u:
+            keys.add(sym_u)
         with self._lock:
-            self._ticks[key] = snap
+            for k in keys:
+                if k:
+                    self._ticks[k] = snap
             self._dirty = True
 
     def get_latest_tick(self, symbol: str) -> Optional[TickSnapshot]:
         with self._lock:
-            return self._ticks.get(symbol)
+            return self._ticks.get((symbol or "").strip().upper())
 
     def store_baseline(
         self,
@@ -108,6 +126,8 @@ class LiveTickBuffer:
         ohlcv: pd.DataFrame,
         vix: Optional[pd.DataFrame],
         engine: str = "ML",
+        underlying_symbol: str = "",
+        instrument_token: str = "",
     ) -> None:
         """Called from GetPrediction/GetGeminiPrediction to snapshot historical data for live merging."""
         with self._lock:
@@ -115,19 +135,63 @@ class LiveTickBuffer:
             self._baseline_vix = vix.copy() if vix is not None else None
             self._baseline_horizon = horizon
             self._baseline_engine = engine
+            self._baseline_underlying = (underlying_symbol or "").strip()
+            self._baseline_instrument_token = (instrument_token or "").strip()
             self._dirty = True
             logger.info(
                 f"Baseline stored: engine={engine} horizon={horizon} "
+                f"underlying={self._baseline_underlying!r} token={self._baseline_instrument_token!r} "
                 f"bars={len(ohlcv) if ohlcv is not None else 0} "
                 f"vix={'yes' if vix is not None and not vix.empty else 'no'}"
             )
 
-    def get_merged_ohlcv(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Returns the baseline OHLCV with the last row updated from the live tick."""
+    def tick_matches_baseline(self, route_key: str) -> bool:
+        """True if this tick's routing key is the same instrument as the stored OHLCV baseline."""
+        rk = (route_key or "").strip().upper()
+        if not rk:
+            return False
+        sym = self._baseline_underlying.strip().upper()
+        tok = self._baseline_instrument_token.strip().upper()
+        if not sym and not tok:
+            return False
+        if tok and rk == tok:
+            return True
+        if sym and rk == sym:
+            return True
+        return False
+
+    def get_baseline_underlying(self) -> str:
+        with self._lock:
+            return self._baseline_underlying
+
+    def get_baseline_tick(self) -> Optional[TickSnapshot]:
+        """Latest tick for the baseline instrument (token or name), if any."""
+        with self._lock:
+            tok = self._baseline_instrument_token.strip().upper()
+            if tok:
+                hit = self._ticks.get(tok)
+                if hit is not None and hit.ltp > 0:
+                    return hit
+            sym = self._baseline_underlying.strip().upper()
+            if sym:
+                hit = self._ticks.get(sym)
+                if hit is not None and hit.ltp > 0:
+                    return hit
+            return None
+
+    def get_merged_ohlcv(self) -> Optional[pd.DataFrame]:
+        """Returns the baseline OHLCV with the last row updated from the live tick for the baseline instrument."""
         with self._lock:
             if self._baseline_ohlcv is None or self._baseline_ohlcv.empty:
                 return None
-            tick = self._ticks.get(symbol)
+            tick = None
+            tok = self._baseline_instrument_token.strip().upper()
+            if tok:
+                tick = self._ticks.get(tok)
+            if tick is None or tick.ltp <= 0:
+                sym = self._baseline_underlying.strip().upper()
+                if sym:
+                    tick = self._ticks.get(sym)
             if tick is None or tick.ltp <= 0:
                 return self._baseline_ohlcv.copy()
 

@@ -70,6 +70,7 @@ class PredictResponse(BaseModel):
     predicted_volatility: float
     current_sensex: float = 0.0
     target_sensex: float = 0.0
+    ai_quota_notice: str = ""
 
 
 # ── Health / debug routes ──────────────────────────────────────────────
@@ -93,7 +94,12 @@ async def debug_ml():
 @app.get("/models/status")
 async def model_status():
     try:
-        from app.inference.predictor import Predictor
+        from app.inference.predictor import ML_PIPELINE_ACTIVE, Predictor
+        if not ML_PIPELINE_ACTIVE:
+            return {
+                "status": "ML_DISABLED",
+                "message": "ML ensemble is turned off (ML_PIPELINE_ACTIVE=False in predictor.py)",
+            }
         predictor = Predictor()
         return predictor.get_model_health()
     except ImportError:
@@ -155,7 +161,12 @@ async def predict(req: PredictRequest):
         else:
             logger.info(f"REST /predict (ML): horizon={req.horizon} bars={len(ohlcv)} vix={len(vix)}")
             try:
-                from app.inference.predictor import Predictor
+                from app.inference.predictor import ML_PIPELINE_ACTIVE, Predictor
+                if not ML_PIPELINE_ACTIVE:
+                    raise HTTPException(
+                        status_code=501,
+                        detail="ML prediction pipeline is disabled; use engine=AI or set ML_PIPELINE_ACTIVE=True",
+                    )
                 predictor = Predictor()
                 result = predictor.predict(
                     horizon=req.horizon,
@@ -167,7 +178,14 @@ async def predict(req: PredictRequest):
                 raise HTTPException(status_code=501, detail="ML prediction pipeline not available; use engine=AI")
 
         buf = get_live_tick_buffer()
-        buf.store_baseline(req.horizon, ohlcv, vix, engine=req.engine.upper())
+        buf.store_baseline(
+            req.horizon,
+            ohlcv,
+            vix,
+            engine=req.engine.upper(),
+            underlying_symbol=req.underlying_symbol or "",
+            instrument_token=req.instrument_token or "",
+        )
 
         return PredictResponse(
             prediction_date=str(date.today()),
@@ -178,6 +196,7 @@ async def predict(req: PredictRequest):
             predicted_volatility=float(result.get("predicted_volatility", 0)),
             current_sensex=float(result.get("current_sensex", 0)),
             target_sensex=float(result.get("target_sensex", 0)),
+            ai_quota_notice=str(result.get("ai_quota_notice", "") or ""),
         )
     except HTTPException:
         raise

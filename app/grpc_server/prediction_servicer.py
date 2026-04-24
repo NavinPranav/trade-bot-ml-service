@@ -21,7 +21,10 @@ _ML_UNAVAILABLE_MSG = (
 
 def _try_import_predictor():
     try:
-        from app.inference.predictor import Predictor
+        from app.inference.predictor import ML_PIPELINE_ACTIVE, Predictor
+        if not ML_PIPELINE_ACTIVE:
+            logger.info("ML Predictor disabled (ML_PIPELINE_ACTIVE=False)")
+            return None
         return Predictor()
     except ImportError:
         logger.warning("ML Predictor unavailable (missing packages)")
@@ -56,6 +59,7 @@ class PredictionServicer:
             predicted_volatility=result["predicted_volatility"],
             current_sensex=result.get("current_sensex", 0),
             target_sensex=result.get("target_sensex", 0),
+            ai_quota_notice=str(result.get("ai_quota_notice", "") or ""),
         )
 
     async def GetPrediction(self, request, context):
@@ -141,7 +145,14 @@ class PredictionServicer:
                     sensex_quote=quote,
                 )
 
-            buf.store_baseline(request.horizon, ohlcv, vix, engine=engine)
+            buf.store_baseline(
+                request.horizon,
+                ohlcv,
+                vix,
+                engine=engine,
+                underlying_symbol=request.underlying_symbol or "",
+                instrument_token=request.instrument_token or "",
+            )
 
             return self._build_response(pb2, request.horizon, result)
         except Exception as e:
@@ -274,6 +285,7 @@ class PredictionServicer:
                 route_key = live_tick_routing_key(tick)
                 if (
                     route_key
+                    and buf.tick_matches_baseline(route_key)
                     and buf.should_repredict()
                     and buf.start_repredict()
                 ):
@@ -281,7 +293,6 @@ class PredictionServicer:
                         _predict_executor,
                         self._repredict_from_live,
                         buf,
-                        route_key,
                     )
                     if ok:
                         repredictions += 1
@@ -294,12 +305,13 @@ class PredictionServicer:
         logger.info(msg)
         return pb2.StreamAck(accepted=True, message=msg)
 
-    def _repredict_from_live(self, buf, symbol: str) -> bool:
+    def _repredict_from_live(self, buf) -> bool:
         """Merge live tick into baseline OHLCV and re-run prediction (runs in thread pool).
 
         Routes to the Gemini or ML predictor based on the engine stored with the baseline.
+        Uses only ticks for the baseline underlying (not INDIA VIX or other stream symbols).
         """
-        merged = buf.get_merged_ohlcv(symbol)
+        merged = buf.get_merged_ohlcv()
         if merged is None or merged.empty:
             buf.mark_predicted({})
             return False
@@ -307,8 +319,9 @@ class PredictionServicer:
         horizon = buf.get_baseline_horizon()
         engine = buf.get_baseline_engine()
         vix = buf.get_baseline_vix()
+        baseline_sym = buf.get_baseline_underlying()
 
-        tick = buf.get_latest_tick(symbol)
+        tick = buf.get_baseline_tick()
         quote = None
         if tick and tick.ltp > 0:
             quote = {"price": tick.ltp, "change": tick.change, "change_pct": tick.change_pct}
@@ -318,7 +331,7 @@ class PredictionServicer:
             label = "GEMINI" if use_gemini else "ML"
             logger.info(
                 f"[LIVE RE-PREDICT {label}] horizon={horizon} merged_bars={len(merged)} "
-                f"ltp={tick.ltp if tick else 'N/A'}"
+                f"underlying={baseline_sym!r} ltp={tick.ltp if tick else 'N/A'}"
             )
             if use_gemini:
                 result = self.gemini_predictor.predict(
@@ -326,7 +339,7 @@ class PredictionServicer:
                     ohlcv=merged,
                     vix=vix,
                     sensex_quote=quote,
-                    underlying_symbol=symbol,
+                    underlying_symbol=baseline_sym,
                 )
             else:
                 result = self.predictor.predict(
