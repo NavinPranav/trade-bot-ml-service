@@ -72,6 +72,8 @@ message PredictionResponse {
   double target_sensex = 8;
   // Non-empty when Gemini returned 429 (quota/rate limit) and a HOLD placeholder was used.
   string ai_quota_notice = 9;
+  // Short natural-language rationale (Gemini); streamed to clients for UI.
+  string prediction_reason = 10;
 }
 
 message VolatilityRequest {

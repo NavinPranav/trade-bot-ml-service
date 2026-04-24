@@ -79,7 +79,9 @@ _SYSTEM_PROMPT = (
     "HOLD = no clear edge, wait, or keep existing exposure unchanged), "
     "magnitude (number, signed percent move you expect for the underlying over the horizon, e.g. 0.8 or -1.2), "
     "confidence (number 0-100 in the BUY/SELL/HOLD call), "
-    "predicted_volatility (number 0-100, higher = more uncertain or volatile regime for sizing). "
+    "predicted_volatility (number 0-100, higher = more uncertain or volatile regime for sizing), "
+    "reason (string, 2–5 short sentences in plain English: what you saw in recent OHLCV and VIX, "
+    "why that supports BUY vs SELL vs HOLD, and how that ties to magnitude and confidence). "
     "Output is for analytics and education only, not personalized investment advice."
 )
 
@@ -141,6 +143,13 @@ def _coerce_result(raw: dict[str, Any], realtime_price: float) -> Dict[str, Any]
     if current_sensex and magnitude:
         target_sensex = round(current_sensex * (1 + magnitude / 100), 2)
 
+    reason_raw = raw.get("reason")
+    if reason_raw is None:
+        reason_raw = raw.get("rationale") if raw.get("rationale") is not None else raw.get("explanation")
+    reason = str(reason_raw or "").strip()
+    if len(reason) > 4000:
+        reason = reason[:4000] + "…"
+
     out: Dict[str, Any] = {
         "direction": direction,
         "magnitude": round(magnitude, 4),
@@ -148,6 +157,7 @@ def _coerce_result(raw: dict[str, Any], realtime_price: float) -> Dict[str, Any]
         "predicted_volatility": round(predicted_volatility, 4),
         "current_sensex": current_sensex,
         "target_sensex": target_sensex,
+        "prediction_reason": reason,
     }
     notice = raw.get("ai_quota_notice")
     if notice:
@@ -191,6 +201,7 @@ class GeminiPredictor:
                 "predicted_volatility": 0,
                 "current_sensex": 0,
                 "target_sensex": 0,
+                "prediction_reason": "No OHLCV bars were available, so the model could not assess trend or volatility.",
             }
 
         if vix is None or vix.empty:
@@ -256,6 +267,10 @@ class GeminiPredictor:
                         "confidence": 0.0,
                         "predicted_volatility": 0.0,
                         "ai_quota_notice": _GEMINI_QUOTA_USER_NOTICE,
+                        "reason": (
+                            "Gemini returned HTTP 429 (quota or rate limit), so no fresh model pass ran. "
+                            "The HOLD placeholder is not based on current bars."
+                        ),
                     },
                     float(realtime["price"]),
                 )

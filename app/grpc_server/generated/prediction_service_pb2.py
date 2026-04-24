@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18prediction_service.proto\x12\tsensex.ml\"\x07\n\x05\x45mpty\"m\n\x08OhlcvBar\x12\x19\n\x11timestamp_unix_ms\x18\x01 \x01(\x03\x12\x0c\n\x04open\x18\x02 \x01(\x01\x12\x0c\n\x04high\x18\x03 \x01(\x01\x12\x0b\n\x03low\x18\x04 \x01(\x01\x12\r\n\x05\x63lose\x18\x05 \x01(\x01\x12\x0e\n\x06volume\x18\x06 \x01(\x03\"2\n\x08VixPoint\x12\x19\n\x11timestamp_unix_ms\x18\x01 \x01(\x03\x12\x0b\n\x03vix\x18\x02 \x01(\x01\"@\n\x0bSensexQuote\x12\r\n\x05price\x18\x01 \x01(\x01\x12\x0e\n\x06\x63hange\x18\x02 \x01(\x01\x12\x12\n\nchange_pct\x18\x03 \x01(\x01\"\xda\x01\n\x11PredictionRequest\x12\x0f\n\x07horizon\x18\x01 \x01(\t\x12)\n\x0csensex_ohlcv\x18\x02 \x03(\x0b\x32\x13.sensex.ml.OhlcvBar\x12&\n\tindia_vix\x18\x03 \x03(\x0b\x32\x13.sensex.ml.VixPoint\x12,\n\x0csensex_quote\x18\x04 \x01(\x0b\x32\x16.sensex.ml.SensexQuote\x12\x19\n\x11underlying_symbol\x18\x05 \x01(\t\x12\x18\n\x10instrument_token\x18\x06 \x01(\t\"\xde\x01\n\x12PredictionResponse\x12\x17\n\x0fprediction_date\x18\x01 \x01(\t\x12\x0f\n\x07horizon\x18\x02 \x01(\t\x12\x11\n\tdirection\x18\x03 \x01(\t\x12\x11\n\tmagnitude\x18\x04 \x01(\x01\x12\x12\n\nconfidence\x18\x05 \x01(\x01\x12\x1c\n\x14predicted_volatility\x18\x06 \x01(\x01\x12\x16\n\x0e\x63urrent_sensex\x18\x07 \x01(\x01\x12\x15\n\rtarget_sensex\x18\x08 \x01(\x01\x12\x17\n\x0f\x61i_quota_notice\x18\t \x01(\t\"m\n\x11VolatilityRequest\x12\x12\n\ndays_ahead\x18\x01 \x01(\x05\x12)\n\x0csensex_ohlcv\x18\x02 \x03(\x0b\x32\x13.sensex.ml.OhlcvBar\x12\x19\n\x11underlying_symbol\x18\x03 \x01(\t\"e\n\x12VolatilityResponse\x12\x14\n\x0cpredicted_rv\x18\x01 \x01(\x01\x12\x12\n\ncurrent_iv\x18\x02 \x01(\x01\x12\x15\n\riv_percentile\x18\x03 \x01(\x01\x12\x0e\n\x06signal\x18\x04 \x01(\t\"g\n\x0f\x42\x61\x63ktestRequest\x12\x15\n\rstrategy_type\x18\x01 \x01(\t\x12\x12\n\nstart_date\x18\x02 \x01(\t\x12\x10\n\x08\x65nd_date\x18\x03 \x01(\t\x12\x17\n\x0fparameters_json\x18\x04 \x01(\t\"Q\n\x10\x42\x61\x63ktestProgress\x12\x18\n\x10progress_percent\x18\x01 \x01(\x05\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x13\n\x0bresult_json\x18\x03 \x01(\t\"F\n\x19\x46\x65\x61tureImportanceResponse\x12)\n\x08\x66\x65\x61tures\x18\x01 \x03(\x0b\x32\x17.sensex.ml.FeatureScore\"8\n\x0c\x46\x65\x61tureScore\x12\x14\n\x0c\x66\x65\x61ture_name\x18\x01 \x01(\t\x12\x12\n\nimportance\x18\x02 \x01(\x01\"\x86\x01\n\x13ModelHealthResponse\x12\x15\n\rmodel_version\x18\x01 \x01(\t\x12\x14\n\x0clast_trained\x18\x02 \x01(\t\x12\x17\n\x0frecent_accuracy\x18\x03 \x01(\x01\x12\x19\n\x11predictions_today\x18\x04 \x01(\x05\x12\x0e\n\x06status\x18\x05 \x01(\t\"\xe2\x01\n\x08LiveTick\x12\x0e\n\x06symbol\x18\x01 \x01(\t\x12\x15\n\rexchange_type\x18\x02 \x01(\x05\x12\r\n\x05token\x18\x03 \x01(\t\x12\x19\n\x11last_traded_price\x18\x04 \x01(\x01\x12\x0c\n\x04open\x18\x05 \x01(\x01\x12\x0c\n\x04high\x18\x06 \x01(\x01\x12\x0b\n\x03low\x18\x07 \x01(\x01\x12\r\n\x05\x63lose\x18\x08 \x01(\x01\x12\x0e\n\x06\x63hange\x18\t \x01(\x01\x12\x12\n\nchange_pct\x18\n \x01(\x01\x12\x0e\n\x06volume\x18\x0b \x01(\x03\x12\x19\n\x11timestamp_unix_ms\x18\x0c \x01(\x03\".\n\tStreamAck\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t2\xa9\x04\n\x11PredictionService\x12L\n\rGetPrediction\x12\x1c.sensex.ml.PredictionRequest\x1a\x1d.sensex.ml.PredictionResponse\x12R\n\x13GetGeminiPrediction\x12\x1c.sensex.ml.PredictionRequest\x1a\x1d.sensex.ml.PredictionResponse\x12T\n\x15GetVolatilityForecast\x12\x1c.sensex.ml.VolatilityRequest\x1a\x1d.sensex.ml.VolatilityResponse\x12H\n\x0bRunBacktest\x12\x1a.sensex.ml.BacktestRequest\x1a\x1b.sensex.ml.BacktestProgress0\x01\x12N\n\x14GetFeatureImportance\x12\x10.sensex.ml.Empty\x1a$.sensex.ml.FeatureImportanceResponse\x12\x42\n\x0eGetModelHealth\x12\x10.sensex.ml.Empty\x1a\x1e.sensex.ml.ModelHealthResponse\x12>\n\x0fStreamLiveTicks\x12\x13.sensex.ml.LiveTick\x1a\x14.sensex.ml.StreamAck(\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18prediction_service.proto\x12\tsensex.ml\"\x07\n\x05\x45mpty\"m\n\x08OhlcvBar\x12\x19\n\x11timestamp_unix_ms\x18\x01 \x01(\x03\x12\x0c\n\x04open\x18\x02 \x01(\x01\x12\x0c\n\x04high\x18\x03 \x01(\x01\x12\x0b\n\x03low\x18\x04 \x01(\x01\x12\r\n\x05\x63lose\x18\x05 \x01(\x01\x12\x0e\n\x06volume\x18\x06 \x01(\x03\"2\n\x08VixPoint\x12\x19\n\x11timestamp_unix_ms\x18\x01 \x01(\x03\x12\x0b\n\x03vix\x18\x02 \x01(\x01\"@\n\x0bSensexQuote\x12\r\n\x05price\x18\x01 \x01(\x01\x12\x0e\n\x06\x63hange\x18\x02 \x01(\x01\x12\x12\n\nchange_pct\x18\x03 \x01(\x01\"\xda\x01\n\x11PredictionRequest\x12\x0f\n\x07horizon\x18\x01 \x01(\t\x12)\n\x0csensex_ohlcv\x18\x02 \x03(\x0b\x32\x13.sensex.ml.OhlcvBar\x12&\n\tindia_vix\x18\x03 \x03(\x0b\x32\x13.sensex.ml.VixPoint\x12,\n\x0csensex_quote\x18\x04 \x01(\x0b\x32\x16.sensex.ml.SensexQuote\x12\x19\n\x11underlying_symbol\x18\x05 \x01(\t\x12\x18\n\x10instrument_token\x18\x06 \x01(\t\"\xf9\x01\n\x12PredictionResponse\x12\x17\n\x0fprediction_date\x18\x01 \x01(\t\x12\x0f\n\x07horizon\x18\x02 \x01(\t\x12\x11\n\tdirection\x18\x03 \x01(\t\x12\x11\n\tmagnitude\x18\x04 \x01(\x01\x12\x12\n\nconfidence\x18\x05 \x01(\x01\x12\x1c\n\x14predicted_volatility\x18\x06 \x01(\x01\x12\x16\n\x0e\x63urrent_sensex\x18\x07 \x01(\x01\x12\x15\n\rtarget_sensex\x18\x08 \x01(\x01\x12\x17\n\x0f\x61i_quota_notice\x18\t \x01(\t\x12\x19\n\x11prediction_reason\x18\n \x01(\t\"m\n\x11VolatilityRequest\x12\x12\n\ndays_ahead\x18\x01 \x01(\x05\x12)\n\x0csensex_ohlcv\x18\x02 \x03(\x0b\x32\x13.sensex.ml.OhlcvBar\x12\x19\n\x11underlying_symbol\x18\x03 \x01(\t\"e\n\x12VolatilityResponse\x12\x14\n\x0cpredicted_rv\x18\x01 \x01(\x01\x12\x12\n\ncurrent_iv\x18\x02 \x01(\x01\x12\x15\n\riv_percentile\x18\x03 \x01(\x01\x12\x0e\n\x06signal\x18\x04 \x01(\t\"g\n\x0f\x42\x61\x63ktestRequest\x12\x15\n\rstrategy_type\x18\x01 \x01(\t\x12\x12\n\nstart_date\x18\x02 \x01(\t\x12\x10\n\x08\x65nd_date\x18\x03 \x01(\t\x12\x17\n\x0fparameters_json\x18\x04 \x01(\t\"Q\n\x10\x42\x61\x63ktestProgress\x12\x18\n\x10progress_percent\x18\x01 \x01(\x05\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x13\n\x0bresult_json\x18\x03 \x01(\t\"F\n\x19\x46\x65\x61tureImportanceResponse\x12)\n\x08\x66\x65\x61tures\x18\x01 \x03(\x0b\x32\x17.sensex.ml.FeatureScore\"8\n\x0c\x46\x65\x61tureScore\x12\x14\n\x0c\x66\x65\x61ture_name\x18\x01 \x01(\t\x12\x12\n\nimportance\x18\x02 \x01(\x01\"\x86\x01\n\x13ModelHealthResponse\x12\x15\n\rmodel_version\x18\x01 \x01(\t\x12\x14\n\x0clast_trained\x18\x02 \x01(\t\x12\x17\n\x0frecent_accuracy\x18\x03 \x01(\x01\x12\x19\n\x11predictions_today\x18\x04 \x01(\x05\x12\x0e\n\x06status\x18\x05 \x01(\t\"\xe2\x01\n\x08LiveTick\x12\x0e\n\x06symbol\x18\x01 \x01(\t\x12\x15\n\rexchange_type\x18\x02 \x01(\x05\x12\r\n\x05token\x18\x03 \x01(\t\x12\x19\n\x11last_traded_price\x18\x04 \x01(\x01\x12\x0c\n\x04open\x18\x05 \x01(\x01\x12\x0c\n\x04high\x18\x06 \x01(\x01\x12\x0b\n\x03low\x18\x07 \x01(\x01\x12\r\n\x05\x63lose\x18\x08 \x01(\x01\x12\x0e\n\x06\x63hange\x18\t \x01(\x01\x12\x12\n\nchange_pct\x18\n \x01(\x01\x12\x0e\n\x06volume\x18\x0b \x01(\x03\x12\x19\n\x11timestamp_unix_ms\x18\x0c \x01(\x03\".\n\tStreamAck\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t2\xa9\x04\n\x11PredictionService\x12L\n\rGetPrediction\x12\x1c.sensex.ml.PredictionRequest\x1a\x1d.sensex.ml.PredictionResponse\x12R\n\x13GetGeminiPrediction\x12\x1c.sensex.ml.PredictionRequest\x1a\x1d.sensex.ml.PredictionResponse\x12T\n\x15GetVolatilityForecast\x12\x1c.sensex.ml.VolatilityRequest\x1a\x1d.sensex.ml.VolatilityResponse\x12H\n\x0bRunBacktest\x12\x1a.sensex.ml.BacktestRequest\x1a\x1b.sensex.ml.BacktestProgress0\x01\x12N\n\x14GetFeatureImportance\x12\x10.sensex.ml.Empty\x1a$.sensex.ml.FeatureImportanceResponse\x12\x42\n\x0eGetModelHealth\x12\x10.sensex.ml.Empty\x1a\x1e.sensex.ml.ModelHealthResponse\x12>\n\x0fStreamLiveTicks\x12\x13.sensex.ml.LiveTick\x1a\x14.sensex.ml.StreamAck(\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -42,25 +42,25 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_PREDICTIONREQUEST']._serialized_start=278
   _globals['_PREDICTIONREQUEST']._serialized_end=496
   _globals['_PREDICTIONRESPONSE']._serialized_start=499
-  _globals['_PREDICTIONRESPONSE']._serialized_end=721
-  _globals['_VOLATILITYREQUEST']._serialized_start=723
-  _globals['_VOLATILITYREQUEST']._serialized_end=832
-  _globals['_VOLATILITYRESPONSE']._serialized_start=834
-  _globals['_VOLATILITYRESPONSE']._serialized_end=935
-  _globals['_BACKTESTREQUEST']._serialized_start=937
-  _globals['_BACKTESTREQUEST']._serialized_end=1040
-  _globals['_BACKTESTPROGRESS']._serialized_start=1042
-  _globals['_BACKTESTPROGRESS']._serialized_end=1123
-  _globals['_FEATUREIMPORTANCERESPONSE']._serialized_start=1125
-  _globals['_FEATUREIMPORTANCERESPONSE']._serialized_end=1195
-  _globals['_FEATURESCORE']._serialized_start=1197
-  _globals['_FEATURESCORE']._serialized_end=1253
-  _globals['_MODELHEALTHRESPONSE']._serialized_start=1256
-  _globals['_MODELHEALTHRESPONSE']._serialized_end=1390
-  _globals['_LIVETICK']._serialized_start=1393
-  _globals['_LIVETICK']._serialized_end=1619
-  _globals['_STREAMACK']._serialized_start=1621
-  _globals['_STREAMACK']._serialized_end=1667
-  _globals['_PREDICTIONSERVICE']._serialized_start=1670
-  _globals['_PREDICTIONSERVICE']._serialized_end=2223
+  _globals['_PREDICTIONRESPONSE']._serialized_end=748
+  _globals['_VOLATILITYREQUEST']._serialized_start=750
+  _globals['_VOLATILITYREQUEST']._serialized_end=859
+  _globals['_VOLATILITYRESPONSE']._serialized_start=861
+  _globals['_VOLATILITYRESPONSE']._serialized_end=962
+  _globals['_BACKTESTREQUEST']._serialized_start=964
+  _globals['_BACKTESTREQUEST']._serialized_end=1067
+  _globals['_BACKTESTPROGRESS']._serialized_start=1069
+  _globals['_BACKTESTPROGRESS']._serialized_end=1150
+  _globals['_FEATUREIMPORTANCERESPONSE']._serialized_start=1152
+  _globals['_FEATUREIMPORTANCERESPONSE']._serialized_end=1222
+  _globals['_FEATURESCORE']._serialized_start=1224
+  _globals['_FEATURESCORE']._serialized_end=1280
+  _globals['_MODELHEALTHRESPONSE']._serialized_start=1283
+  _globals['_MODELHEALTHRESPONSE']._serialized_end=1417
+  _globals['_LIVETICK']._serialized_start=1420
+  _globals['_LIVETICK']._serialized_end=1646
+  _globals['_STREAMACK']._serialized_start=1648
+  _globals['_STREAMACK']._serialized_end=1694
+  _globals['_PREDICTIONSERVICE']._serialized_start=1697
+  _globals['_PREDICTIONSERVICE']._serialized_end=2250
 # @@protoc_insertion_point(module_scope)

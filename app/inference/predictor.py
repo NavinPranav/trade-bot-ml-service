@@ -61,6 +61,7 @@ class Predictor:
                 "magnitude": 0,
                 "confidence": 0,
                 "predicted_volatility": 0,
+                "prediction_reason": "",
             }
 
         if vix is None or vix.empty:
@@ -84,6 +85,7 @@ class Predictor:
             "predicted_volatility": 0.0,
             "current_sensex": realtime.get("price", 0.0),
             "target_sensex": realtime.get("price", 0.0),
+            "prediction_reason": "",
         }
         if not bypass_cache:
             cache_prediction(horizon, result, ttl=300, data_fingerprint=cache_fp, engine=cache_engine)

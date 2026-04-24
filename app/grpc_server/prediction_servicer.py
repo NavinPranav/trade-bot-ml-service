@@ -60,6 +60,7 @@ class PredictionServicer:
             current_sensex=result.get("current_sensex", 0),
             target_sensex=result.get("target_sensex", 0),
             ai_quota_notice=str(result.get("ai_quota_notice", "") or ""),
+            prediction_reason=str(result.get("prediction_reason", "") or ""),
         )
 
     async def GetPrediction(self, request, context):

@@ -71,6 +71,7 @@ class PredictResponse(BaseModel):
     current_sensex: float = 0.0
     target_sensex: float = 0.0
     ai_quota_notice: str = ""
+    prediction_reason: str = ""
 
 
 # ── Health / debug routes ──────────────────────────────────────────────
@@ -197,6 +198,7 @@ async def predict(req: PredictRequest):
             current_sensex=float(result.get("current_sensex", 0)),
             target_sensex=float(result.get("target_sensex", 0)),
             ai_quota_notice=str(result.get("ai_quota_notice", "") or ""),
+            prediction_reason=str(result.get("prediction_reason", "") or ""),
         )
     except HTTPException:
         raise
