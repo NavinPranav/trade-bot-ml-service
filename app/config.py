@@ -33,8 +33,8 @@ class Settings(BaseSettings):
     market_open: str = "09:15"
     market_close: str = "15:30"
     timezone: str = "Asia/Kolkata"
-    # Minimum rows after aggregating gRPC OhlcvBar → one row per calendar day (not raw bar count).
-    min_ohlcv_bars_grpc: int = 100
+    # Minimum bars required. Intra-day 1M/5M feeds accumulate quickly; 30 bars covers ~30 min of 1M data.
+    min_ohlcv_bars_grpc: int = 30
 
     # Live tick stream → debounced inference (uses baseline OHLCV from last GetPrediction for that symbol).
     live_inference_enabled: bool = True

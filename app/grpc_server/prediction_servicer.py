@@ -49,7 +49,25 @@ class PredictionServicer:
         self.backtest_engine = _try_import_backtest()
 
     def _build_response(self, pb2, horizon: str, result: dict):
-        """Build a PredictionResponse proto from a result dict."""
+        """Build a PredictionResponse proto from a result dict.
+
+        Trading levels (entry_price, stop_loss, target_price, risk_reward,
+        valid_minutes) are serialised as a JSON suffix in prediction_reason
+        so the Java backend can extract them without a proto schema change.
+        """
+        reason_text = str(result.get("prediction_reason", "") or "").strip()
+
+        levels: dict = {}
+        for k in ("entry_price", "stop_loss", "target_price", "risk_reward", "valid_minutes"):
+            v = result.get(k)
+            if v is not None:
+                levels[k] = v
+
+        if levels:
+            reason_with_levels = f"{reason_text}\n\n[TRADING_LEVELS]{json.dumps(levels)}"
+        else:
+            reason_with_levels = reason_text
+
         return pb2.PredictionResponse(
             prediction_date=str(date.today()),
             horizon=horizon,
@@ -60,7 +78,7 @@ class PredictionServicer:
             current_sensex=result.get("current_sensex", 0),
             target_sensex=result.get("target_sensex", 0),
             ai_quota_notice=str(result.get("ai_quota_notice", "") or ""),
-            prediction_reason=str(result.get("prediction_reason", "") or ""),
+            prediction_reason=reason_with_levels,
         )
 
     async def GetPrediction(self, request, context):
