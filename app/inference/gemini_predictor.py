@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
@@ -119,6 +120,15 @@ _GEMINI_QUOTA_USER_NOTICE = (
     "The signal below is a neutral placeholder (HOLD), not a model forecast. "
     "Try again later or check billing/plan limits: https://ai.google.dev/gemini-api/docs/rate-limits"
 )
+
+_GEMINI_OVERLOAD_USER_NOTICE = (
+    "Google Gemini returned a temporary capacity error (HTTP 503). "
+    "The signal below is a neutral placeholder (HOLD). Retry shortly."
+)
+
+# Transient upstream errors — retry before failing the request.
+_GEMINI_RETRYABLE_HTTP = frozenset({502, 503})
+_GEMINI_MAX_LOAD_RETRIES = 4
 
 
 def _coerce_result(raw: dict[str, Any], realtime_price: float) -> Dict[str, Any]:
@@ -237,10 +247,10 @@ class GeminiPredictor:
 
         headers = {"Content-Type": "application/json"}
 
-        with httpx.Client(timeout=120.0) as client:
-            resp = client.post(url, headers=headers, json=body)
-            if resp.status_code == 400:
-                detail = (resp.text or "")[:2048]
+        def _post_once(client: httpx.Client) -> httpx.Response:
+            r = client.post(url, headers=headers, json=body)
+            if r.status_code == 400:
+                detail = (r.text or "")[:2048]
                 logger.warning(
                     "Gemini generateContent 400 with JSON mode model={!r}: {}",
                     model,
@@ -251,7 +261,28 @@ class GeminiPredictor:
                     "contents": body["contents"],
                     "generationConfig": {"temperature": 0.2},
                 }
-                resp = client.post(url, headers=headers, json=body_plain)
+                r = client.post(url, headers=headers, json=body_plain)
+            return r
+
+        with httpx.Client(timeout=120.0) as client:
+            resp: Optional[httpx.Response] = None
+            for attempt in range(_GEMINI_MAX_LOAD_RETRIES):
+                resp = _post_once(client)
+                if resp.status_code in _GEMINI_RETRYABLE_HTTP and attempt < _GEMINI_MAX_LOAD_RETRIES - 1:
+                    wait_s = min(8.0, 0.75 * (2**attempt))
+                    logger.warning(
+                        "Gemini generateContent {} (transient) model={!r} attempt {}/{} — retry in {:.1f}s",
+                        resp.status_code,
+                        model,
+                        attempt + 1,
+                        _GEMINI_MAX_LOAD_RETRIES,
+                        wait_s,
+                    )
+                    time.sleep(wait_s)
+                    continue
+                break
+
+            assert resp is not None
             # Free-tier / billing quota and per-minute rate limits (RESOURCE_EXHAUSTED → HTTP 429)
             if resp.status_code == 429:
                 detail = (resp.text or "")[:1024]
@@ -269,6 +300,30 @@ class GeminiPredictor:
                         "ai_quota_notice": _GEMINI_QUOTA_USER_NOTICE,
                         "reason": (
                             "Gemini returned HTTP 429 (quota or rate limit), so no fresh model pass ran. "
+                            "The HOLD placeholder is not based on current bars."
+                        ),
+                    },
+                    float(realtime["price"]),
+                )
+            # After retries, still overloaded — soft HOLD like 429 so the API stays 200.
+            if resp.status_code in _GEMINI_RETRYABLE_HTTP:
+                detail = (resp.text or "")[:1024]
+                logger.warning(
+                    "Gemini still {} after {} attempts model={!r} — HOLD fallback. {}",
+                    resp.status_code,
+                    _GEMINI_MAX_LOAD_RETRIES,
+                    model,
+                    detail,
+                )
+                return _coerce_result(
+                    {
+                        "direction": "HOLD",
+                        "magnitude": 0.0,
+                        "confidence": 0.0,
+                        "predicted_volatility": 0.0,
+                        "ai_quota_notice": _GEMINI_OVERLOAD_USER_NOTICE,
+                        "reason": (
+                            "Gemini returned repeated capacity errors (HTTP 502/503), so no fresh model pass ran. "
                             "The HOLD placeholder is not based on current bars."
                         ),
                     },
