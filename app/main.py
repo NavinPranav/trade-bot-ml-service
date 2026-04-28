@@ -70,6 +70,11 @@ class PredictResponse(BaseModel):
     predicted_volatility: float
     current_sensex: float = 0.0
     target_sensex: float = 0.0
+    entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    target_price: Optional[float] = None
+    risk_reward: Optional[float] = None
+    valid_minutes: Optional[int] = None
     ai_quota_notice: str = ""
     prediction_reason: str = ""
 
@@ -197,6 +202,11 @@ async def predict(req: PredictRequest):
             predicted_volatility=float(result.get("predicted_volatility", 0)),
             current_sensex=float(result.get("current_sensex", 0)),
             target_sensex=float(result.get("target_sensex", 0)),
+            entry_price=float(result.get("entry_price")) if result.get("entry_price") is not None else None,
+            stop_loss=float(result.get("stop_loss")) if result.get("stop_loss") is not None else None,
+            target_price=float(result.get("target_price")) if result.get("target_price") is not None else None,
+            risk_reward=float(result.get("risk_reward")) if result.get("risk_reward") is not None else None,
+            valid_minutes=int(result.get("valid_minutes")) if result.get("valid_minutes") is not None else None,
             ai_quota_notice=str(result.get("ai_quota_notice", "") or ""),
             prediction_reason=str(result.get("prediction_reason", "") or ""),
         )
