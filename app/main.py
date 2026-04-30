@@ -79,6 +79,12 @@ class PredictResponse(BaseModel):
     prediction_reason: str = ""
 
 
+# ── Admin prompt management models ────────────────────────────────────
+
+class PromptUpdateRequest(BaseModel):
+    prompt_text: str
+
+
 # ── Health / debug routes ──────────────────────────────────────────────
 
 @app.get("/")
@@ -110,6 +116,43 @@ async def model_status():
         return predictor.get_model_health()
     except ImportError:
         return {"status": "ML_UNAVAILABLE", "message": "ML packages not installed"}
+
+
+# ── Admin prompt management endpoints ─────────────────────────────────
+
+@app.get("/admin/prompt")
+async def get_active_prompt():
+    from app.inference.gemini_predictor import _PromptStore, _SYSTEM_PROMPT_TEMPLATE
+    custom = _PromptStore.get()
+    return {
+        "active": bool(custom),
+        "prompt_text": custom if custom else _SYSTEM_PROMPT_TEMPLATE,
+        "is_custom": bool(custom),
+    }
+
+
+@app.put("/admin/prompt")
+async def set_active_prompt(req: PromptUpdateRequest):
+    from app.inference.gemini_predictor import _PromptStore
+    text = req.prompt_text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="prompt_text must not be empty")
+    if "{target_minutes}" not in text:
+        raise HTTPException(
+            status_code=400,
+            detail="prompt_text must contain the {target_minutes} dynamic variable"
+        )
+    _PromptStore.set(text)
+    logger.info("Admin prompt updated ({} chars)", len(text))
+    return {"status": "ok", "prompt_length": len(text)}
+
+
+@app.delete("/admin/prompt")
+async def reset_prompt():
+    from app.inference.gemini_predictor import _PromptStore
+    _PromptStore.clear()
+    logger.info("Admin prompt reset to default")
+    return {"status": "ok", "message": "Reverted to default system prompt"}
 
 
 # ── REST prediction endpoint (mirrors gRPC GetPrediction / GetGeminiPrediction) ──

@@ -188,8 +188,30 @@ _SYSTEM_PROMPT_TEMPLATE = (
 )
 
 
+class _PromptStore:
+    """Module-level singleton that holds the currently active admin-set prompt template.
+
+    When empty the default _SYSTEM_PROMPT_TEMPLATE is used. The {target_minutes}
+    placeholder is substituted at call time, so every stored template must contain it.
+    """
+    _custom: str = ""
+
+    @classmethod
+    def set(cls, template: str) -> None:
+        cls._custom = template.strip()
+
+    @classmethod
+    def get(cls) -> str:
+        return cls._custom
+
+    @classmethod
+    def clear(cls) -> None:
+        cls._custom = ""
+
+
 def _build_system_prompt(target_minutes: int) -> str:
-    return _SYSTEM_PROMPT_TEMPLATE.format(target_minutes=target_minutes)
+    template = _PromptStore.get() or _SYSTEM_PROMPT_TEMPLATE
+    return template.format(target_minutes=target_minutes)
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
