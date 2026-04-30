@@ -209,6 +209,27 @@ class _PromptStore:
         cls._custom = ""
 
 
+class _ModelStore:
+    """Module-level singleton for the admin-selected Gemini model ID.
+
+    Falls back to settings.gemini_model (GEMINI_MODEL env var) when not set,
+    so existing deployments keep working without any admin action.
+    """
+    _model_id: str = ""
+
+    @classmethod
+    def set(cls, model_id: str) -> None:
+        cls._model_id = model_id.strip()
+
+    @classmethod
+    def get(cls) -> str:
+        return cls._model_id or settings.gemini_model.strip()
+
+    @classmethod
+    def clear(cls) -> None:
+        cls._model_id = ""
+
+
 def _build_system_prompt(target_minutes: int) -> str:
     template = _PromptStore.get() or _SYSTEM_PROMPT_TEMPLATE
     return template.format(target_minutes=target_minutes)
@@ -396,7 +417,7 @@ class GeminiPredictor:
 
         system_prompt = _build_system_prompt(target_minutes)
         base = settings.gemini_base_url.rstrip("/")
-        model = settings.gemini_model.strip()
+        model = _ModelStore.get()
         path = f"{base}/models/{model}:generateContent"
         url = f"{path}?{urlencode({'key': key})}"
 

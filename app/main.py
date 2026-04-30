@@ -79,10 +79,14 @@ class PredictResponse(BaseModel):
     prediction_reason: str = ""
 
 
-# ── Admin prompt management models ────────────────────────────────────
+# ── Admin management models ────────────────────────────────────────────
 
 class PromptUpdateRequest(BaseModel):
     prompt_text: str
+
+class ModelUpdateRequest(BaseModel):
+    tool: str
+    model_id: str
 
 
 # ── Health / debug routes ──────────────────────────────────────────────
@@ -153,6 +157,40 @@ async def reset_prompt():
     _PromptStore.clear()
     logger.info("Admin prompt reset to default")
     return {"status": "ok", "message": "Reverted to default system prompt"}
+
+
+# ── Admin model management endpoints ──────────────────────────────────
+
+@app.get("/admin/model")
+async def get_active_model():
+    from app.inference.gemini_predictor import _ModelStore
+    from app.config import settings
+    active = _ModelStore.get()
+    return {
+        "model_id": active,
+        "is_override": bool(_ModelStore._model_id),
+        "env_default": settings.gemini_model,
+    }
+
+
+@app.put("/admin/model")
+async def set_active_model(req: ModelUpdateRequest):
+    from app.inference.gemini_predictor import _ModelStore
+    model_id = req.model_id.strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id must not be empty")
+    _ModelStore.set(model_id)
+    logger.info("Admin model updated to '{}' (tool={})", model_id, req.tool)
+    return {"status": "ok", "model_id": model_id, "tool": req.tool}
+
+
+@app.delete("/admin/model")
+async def reset_model():
+    from app.inference.gemini_predictor import _ModelStore
+    from app.config import settings
+    _ModelStore.clear()
+    logger.info("Admin model reset to env default '{}'", settings.gemini_model)
+    return {"status": "ok", "model_id": settings.gemini_model, "message": "Reverted to env default"}
 
 
 # ── REST prediction endpoint (mirrors gRPC GetPrediction / GetGeminiPrediction) ──
