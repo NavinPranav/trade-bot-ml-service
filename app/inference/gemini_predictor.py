@@ -252,7 +252,10 @@ _GEMINI_MAX_LOAD_RETRIES = 4
 
 
 def _coerce_result(raw: dict[str, Any], realtime_price: float) -> Dict[str, Any]:
-    direction = _normalize_direction(raw)
+    # Model output before policy (confidence / R:R). Used so entry/SL/target in history
+    # still reflect what Gemini predicted even when we downgrade the tradable signal to HOLD.
+    model_direction = _normalize_direction(raw)
+    direction = model_direction
 
     def _f(key: str, default: float = 0.0) -> float:
         try:
@@ -266,21 +269,21 @@ def _coerce_result(raw: dict[str, Any], realtime_price: float) -> Dict[str, Any]
     valid_minutes = max(1, int(_f("valid_minutes", 15)))
 
     # Enforce no-trade zone: confidence < 65 → HOLD
-    if confidence < 65.0 and direction != "HOLD":
+    if confidence < 65.0 and model_direction != "HOLD":
         logger.info(
-            f"Confidence {confidence:.1f}% < 65 — overriding {direction} → HOLD (no-trade zone)"
+            f"Confidence {confidence:.1f}% < 65 — overriding {model_direction} → HOLD (no-trade zone)"
         )
         direction = "HOLD"
 
-    # Trading levels
+    # Trading levels (always derive fallbacks from model_direction so below-threshold rows keep levels)
     entry_price = _f("entry_price", realtime_price) or realtime_price
     stop_loss = _f("stop_loss")
     target_price = _f("target_price")
 
     # Fallback stop/target from magnitude if Gemini didn't provide them
-    if not stop_loss and direction != "HOLD":
+    if not stop_loss and model_direction not in ("HOLD",):
         atr_pct = 0.003  # 0.3% fallback stop
-        if direction == "BUY":
+        if model_direction == "BUY":
             stop_loss = round(entry_price * (1 - atr_pct), 2)
         else:
             stop_loss = round(entry_price * (1 + atr_pct), 2)
