@@ -7,11 +7,15 @@ externally-routed port (PORT).  gRPC runs on a secondary internal-only port
 gRPC is not reachable.
 """
 import asyncio
+import json
 import os
+import re
 import threading
 from datetime import date
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from loguru import logger
@@ -87,6 +91,26 @@ class PromptUpdateRequest(BaseModel):
 class ModelUpdateRequest(BaseModel):
     tool: str
     model_id: str
+
+
+class PredictionRecord(BaseModel):
+    id: Optional[int] = None
+    predictionDate: Optional[str] = None
+    horizon: str = ""
+    direction: str = ""
+    confidence: Optional[float] = None
+    entryPrice: Optional[float] = None
+    stopLoss: Optional[float] = None
+    targetSensex: Optional[float] = None
+    actualClosePrice: Optional[float] = None
+    outcomeStatus: Optional[str] = None
+    actualPnlPct: Optional[float] = None
+    predictionReason: Optional[str] = None
+    aiTool: Optional[str] = None
+    aiModel: Optional[str] = None
+
+class AnalyseRequest(BaseModel):
+    predictions: List[PredictionRecord]
 
 
 # ── Health / debug routes ──────────────────────────────────────────────
@@ -191,6 +215,127 @@ async def reset_model():
     _ModelStore.clear()
     logger.info("Admin model reset to env default '{}'", settings.gemini_model)
     return {"status": "ok", "model_id": settings.gemini_model, "message": "Reverted to env default"}
+
+
+# ── Prediction analysis endpoint ──────────────────────────────────────────────
+
+@app.post("/admin/analyse")
+async def analyse_predictions(req: AnalyseRequest):
+    if not req.predictions:
+        raise HTTPException(status_code=400, detail="predictions list must not be empty")
+
+    from app.inference.gemini_predictor import _ModelStore
+
+    key = (settings.gemini_api_key or "").strip()
+    if not key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not set")
+
+    pred_lines: list[str] = []
+    for p in req.predictions:
+        line = (
+            f"[ID={p.id}] Date={p.predictionDate} Horizon={p.horizon} "
+            f"Direction={p.direction} Confidence={p.confidence}% "
+            f"Outcome={p.outcomeStatus or 'PENDING'} PnL={p.actualPnlPct}%"
+        )
+        if p.entryPrice is not None:
+            line += f" Entry={p.entryPrice} SL={p.stopLoss} Target={p.targetSensex}"
+        if p.predictionReason:
+            reason_snippet = p.predictionReason[:600].replace("\n", " ")
+            line += f"\n  Reason: {reason_snippet}"
+        pred_lines.append(line)
+
+    predictions_text = "\n".join(pred_lines)
+
+    system_prompt = (
+        "You are an expert intra-day Bank Nifty trading analyst reviewing a batch of AI-generated predictions. "
+        "For each prediction you are given the signal direction, confidence, stated reason, and actual outcome. "
+        "Your job is to identify what went wrong, what can be improved, and which reasons were not apt or were misleading. "
+        "Respond with ONE JSON object only (no markdown fences), with EXACTLY these keys:\n"
+        '  "overall_assessment": string — 2-4 sentences summarising the overall quality of this batch\n'
+        '  "what_went_wrong": array of strings — specific problems found (e.g. overconfidence, wrong momentum reading)\n'
+        '  "what_can_improve": array of strings — concrete, actionable improvement suggestions for the AI model\n'
+        '  "reason_quality": array of objects with keys id (int), quality_score (0-10), feedback (string) — '
+        "one entry per prediction that has a reason; critique whether the reason matched the outcome\n"
+        '  "patterns": array of strings — recurring patterns observed across predictions (good or bad)\n'
+        '  "recommendations": array of strings — prioritised next steps to improve prediction accuracy\n'
+        "Output ONLY valid JSON — no extra text, no markdown fences."
+    )
+
+    user_text = (
+        f"Analyse these {len(req.predictions)} Bank Nifty predictions and their outcomes:\n\n"
+        f"{predictions_text}"
+    )
+
+    model = _ModelStore.get()
+    base = settings.gemini_base_url.rstrip("/")
+    url = f"{base}/models/{model}:generateContent?{urlencode({'key': key})}"
+
+    body: dict[str, Any] = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+    }
+
+    _max_retries = 3
+    _retry_delays = [10, 20, 40]
+
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            resp = None
+            for attempt in range(_max_retries):
+                resp = client.post(url, headers={"Content-Type": "application/json"}, json=body)
+                if resp.status_code == 429 and attempt < _max_retries - 1:
+                    wait_s = _retry_delays[attempt]
+                    logger.warning(
+                        "Gemini 429 (analyse) attempt {}/{} — retrying in {}s",
+                        attempt + 1, _max_retries, wait_s,
+                    )
+                    import time as _time
+                    _time.sleep(wait_s)
+                    continue
+                break
+
+        if resp.status_code == 429:
+            logger.warning("Gemini 429 exhausted retries for analyse")
+            return {
+                "error": "Gemini rate limit reached — wait a minute and try again",
+                "overall_assessment": None,
+                "what_went_wrong": [],
+                "what_can_improve": [],
+                "reason_quality": [],
+                "patterns": [],
+                "recommendations": [],
+            }
+
+        if resp.status_code >= 400:
+            detail = (resp.text or "")[:1024]
+            logger.error("Gemini analyse HTTP {}: {}", resp.status_code, detail)
+            raise HTTPException(status_code=502, detail=f"Gemini HTTP {resp.status_code}: {detail}")
+
+        data = resp.json()
+        cands = data.get("candidates") or []
+        parts = (cands[0].get("content") or {}).get("parts") if cands else []
+        text = (parts[0].get("text") or "") if parts else ""
+        text = text.strip()
+
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            m = re.search(r"\{[\s\S]*\}", text)
+            if m:
+                result = json.loads(m.group(0))
+            else:
+                logger.error("Could not parse Gemini analysis JSON: {!r}", text[:500])
+                raise HTTPException(status_code=502, detail="Gemini returned unparseable analysis")
+
+        logger.info("Analysis complete for {} predictions", len(req.predictions))
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Analysis endpoint failed: {}", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── REST prediction endpoint (mirrors gRPC GetPrediction / GetGeminiPrediction) ──
