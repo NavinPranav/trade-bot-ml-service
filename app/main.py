@@ -171,7 +171,15 @@ async def set_active_prompt(req: PromptUpdateRequest):
     if "{target_minutes}" not in text:
         raise HTTPException(
             status_code=400,
-            detail="prompt_text must contain the {target_minutes} dynamic variable"
+            detail=(
+                "prompt_text must contain the {target_minutes} dynamic variable. "
+                "Other supported variables: {spot_price}, {ema_20}, {ema_50}, {rsi_14}, "
+                "{vwap}, {atr_14}, {macd}, {macd_signal}, {macd_histogram}, {india_vix}, "
+                "{vix_change}, {volume_ratio}, {support_1}, {support_2}, {resistance_1}, "
+                "{resistance_2}, {pivot}, {open}, {high}, {low}, {prev_close}, "
+                "{day_change_pct}, {market_phase}, {time_ist}, {last_5_candles}, "
+                "{min_confidence}, {min_risk_reward}."
+            )
         )
     _PromptStore.set(text)
     logger.info("Admin prompt updated ({} chars)", len(text))
@@ -235,6 +243,125 @@ async def set_checklist_weight(req: ChecklistWeightRequest):
     _ChecklistWeightStore.set(req.weight)
     logger.info("Admin checklist weight updated to {}%", req.weight)
     return {"status": "ok", "weight": req.weight, "remaining": 100 - req.weight}
+
+
+def _normalize_prediction_policy_body(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept camelCase (UI) or snake_case keys; strip metadata fields."""
+    from app.inference.gemini_predictor import _PredictionPolicyStore as P
+
+    skip = frozenset({"hasActiveOverrides", "envDefaults", "status"})
+    camel_to_snake = {v: k for k, v in P._CAMEL.items()}
+    out: Dict[str, Any] = {}
+    for k, v in (raw or {}).items():
+        if k in skip:
+            continue
+        sk = camel_to_snake.get(k)
+        if sk is None and k in P._SETTINGS_ATTR:
+            sk = k
+        if sk is None or sk not in P._SETTINGS_ATTR:
+            continue
+        out[sk] = v
+    return out
+
+
+def _validate_prediction_policy_patch(p: Dict[str, Any]) -> List[str]:
+    errs: List[str] = []
+
+    def _f(key: str, lo: float, hi: float) -> None:
+        if key not in p:
+            return
+        try:
+            x = float(p[key])
+        except (TypeError, ValueError):
+            errs.append(f"{key} must be a number")
+            return
+        if x < lo or x > hi:
+            errs.append(f"{key} must be between {lo} and {hi}")
+
+    _f("min_confidence", 0, 100)
+    _f("min_risk_reward", 0.5, 20)
+    _f("strong_trend_min_ema_gap_pct", 0, 5)
+    _f("relaxed_confidence_floor_strong_trend", 0, 100)
+    _f("sell_near_support_min_confidence", 0, 100)
+    _f("min_atr_pct_of_price", 0, 10)
+    if "rate_limit_max_retries" in p:
+        try:
+            x = int(p["rate_limit_max_retries"])
+            if x < 1 or x > 20:
+                errs.append("rate_limit_max_retries must be 1–20")
+        except (TypeError, ValueError):
+            errs.append("rate_limit_max_retries must be an integer")
+    if "rate_limit_retry_base_delay_sec" in p:
+        try:
+            x = float(p["rate_limit_retry_base_delay_sec"])
+            if x < 1 or x > 120:
+                errs.append("rate_limit_retry_base_delay_sec must be 1–120")
+        except (TypeError, ValueError):
+            errs.append("rate_limit_retry_base_delay_sec must be a number")
+    return errs
+
+
+@app.get("/admin/prediction-policy")
+async def get_prediction_policy():
+    """Effective prediction thresholds (admin overrides merged with env defaults)."""
+    from app.inference.gemini_predictor import _PredictionPolicyStore
+
+    eff = _PredictionPolicyStore.to_public_dict()
+    env_defaults: Dict[str, Any] = {}
+    for sk, camel in _PredictionPolicyStore._CAMEL.items():
+        env_defaults[camel] = getattr(settings, _PredictionPolicyStore._SETTINGS_ATTR[sk])
+    eff["envDefaults"] = env_defaults
+    return eff
+
+
+@app.put("/admin/prediction-policy")
+async def put_prediction_policy(body: Dict[str, Any]):
+    from app.inference.gemini_predictor import _PredictionPolicyStore
+
+    patch = _normalize_prediction_policy_body(body)
+    if not patch:
+        raise HTTPException(status_code=400, detail="No valid policy fields in body")
+    errs = _validate_prediction_policy_patch(patch)
+    if errs:
+        raise HTTPException(status_code=400, detail="; ".join(errs))
+    _PredictionPolicyStore.apply_updates(patch)
+    logger.info("Admin prediction policy updated: {}", list(patch.keys()))
+    eff = _PredictionPolicyStore.to_public_dict()
+    env_defaults = {camel: getattr(settings, _PredictionPolicyStore._SETTINGS_ATTR[sk]) for sk, camel in _PredictionPolicyStore._CAMEL.items()}
+    eff["envDefaults"] = env_defaults
+    return eff
+
+
+@app.delete("/admin/prediction-policy")
+async def delete_prediction_policy():
+    """Clear admin overrides; process env values apply again."""
+    from app.inference.gemini_predictor import _PredictionPolicyStore
+
+    _PredictionPolicyStore.clear()
+    logger.info("Admin prediction policy overrides cleared")
+    eff = _PredictionPolicyStore.to_public_dict()
+    env_defaults = {camel: getattr(settings, _PredictionPolicyStore._SETTINGS_ATTR[sk]) for sk, camel in _PredictionPolicyStore._CAMEL.items()}
+    eff["envDefaults"] = env_defaults
+    return eff
+
+
+# ── Admin news-sentiment debug endpoints ─────────────────────────────────────
+
+@app.get("/admin/news-sentiment")
+async def get_news_sentiment_status():
+    """Return the currently cached news sentiment (or fetch fresh if cache is cold)."""
+    from app.data.ingestion.news_fetcher import get_news_sentiment, _SentimentCache
+    result = get_news_sentiment()
+    return result
+
+
+@app.post("/admin/news-sentiment/refresh")
+async def refresh_news_sentiment():
+    """Force-invalidate the cache and fetch a fresh batch from NewsAPI."""
+    from app.data.ingestion.news_fetcher import _SentimentCache, get_news_sentiment
+    _SentimentCache.invalidate()
+    result = get_news_sentiment()
+    return {"status": "refreshed", **result}
 
 
 # ── Prediction analysis endpoint ──────────────────────────────────────────────
