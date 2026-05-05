@@ -38,7 +38,7 @@ class Settings(BaseSettings):
 
     # Live tick stream → debounced inference (uses baseline OHLCV from last GetPrediction for that symbol).
     live_inference_enabled: bool = True
-    live_inference_interval_sec: float = 5.0
+    live_inference_interval_sec: float = 300.0
 
     # Google Gemini (used by GetGeminiPrediction RPC when prediction_engine=AI)
     gemini_api_key: str = ""

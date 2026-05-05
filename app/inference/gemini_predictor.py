@@ -19,6 +19,7 @@ from loguru import logger
 
 from app.config import settings
 from app.data.ingestion.vix_fetcher import derive_vix_from_ohlcv
+from app.inference.checklist import run_checklist
 
 # Maps horizon label → minutes ahead we are predicting
 _HORIZON_MINUTES: dict[str, int] = {
@@ -230,9 +231,36 @@ class _ModelStore:
         cls._model_id = ""
 
 
-def _build_system_prompt(target_minutes: int) -> str:
+class _ChecklistWeightStore:
+    """Module-level singleton for the admin-configured checklist signal weight (0–100 %).
+
+    Default is 40 — meaning 40% of the AI conviction should come from the
+    rule-based checklist result, with the remaining 60% from its own OHLCV analysis.
+    """
+    _weight: int = 40
+
+    @classmethod
+    def set(cls, weight: int) -> None:
+        cls._weight = max(0, min(100, int(weight)))
+
+    @classmethod
+    def get(cls) -> int:
+        return cls._weight
+
+
+def _build_system_prompt(target_minutes: int, checklist_weight: int = 40) -> str:
+    remaining = 100 - checklist_weight
     template = _PromptStore.get() or _SYSTEM_PROMPT_TEMPLATE
-    return template.format(target_minutes=target_minutes)
+    base = template.format(target_minutes=target_minutes)
+    checklist_suffix = (
+        f"\n\nCHECKLIST SIGNAL (weight: {checklist_weight}%):\n"
+        "The following 8-step rule-based checklist was computed from the same market data "
+        "provided above (EMA trend, VWAP, RSI, pivot levels, entry candle, strike selection, "
+        "risk management, no-trade conditions). Weight its overall signal at "
+        f"{checklist_weight}% of your final conviction; derive the remaining "
+        f"{remaining}% from your own OHLCV and indicator analysis."
+    )
+    return base + checklist_suffix
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -403,6 +431,13 @@ class GeminiPredictor:
         # Compute technical indicators for the current bar
         indicators = _compute_indicator_snapshot(ohlcv)
 
+        checklist_weight = _ChecklistWeightStore.get()
+        try:
+            checklist_signal = run_checklist(ohlcv)
+        except Exception as e:
+            logger.warning("Checklist computation failed: {}", e)
+            checklist_signal = {"overall": "NO_DATA", "error": str(e)}
+
         user_payload = {
             "horizon": horizon,
             "target_minutes": target_minutes,
@@ -412,10 +447,11 @@ class GeminiPredictor:
             "recent_ohlcv_bars": _ohlcv_tail_records(ohlcv),
             "technical_indicators": indicators,
             "india_vix": _vix_tail_summary(vix),
+            "checklist_signal": checklist_signal,
         }
         user_text = json.dumps(user_payload, default=str)
 
-        system_prompt = _build_system_prompt(target_minutes)
+        system_prompt = _build_system_prompt(target_minutes, checklist_weight)
         base = settings.gemini_base_url.rstrip("/")
         model = _ModelStore.get()
         path = f"{base}/models/{model}:generateContent"

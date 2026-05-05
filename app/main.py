@@ -92,6 +92,9 @@ class ModelUpdateRequest(BaseModel):
     tool: str
     model_id: str
 
+class ChecklistWeightRequest(BaseModel):
+    weight: int = Field(ge=0, le=100, description="Checklist signal weight as a percentage (0–100)")
+
 
 class PredictionRecord(BaseModel):
     id: Optional[int] = None
@@ -215,6 +218,23 @@ async def reset_model():
     _ModelStore.clear()
     logger.info("Admin model reset to env default '{}'", settings.gemini_model)
     return {"status": "ok", "model_id": settings.gemini_model, "message": "Reverted to env default"}
+
+
+# ── Admin checklist weight endpoints ─────────────────────────────────────────
+
+@app.get("/admin/checklist-weight")
+async def get_checklist_weight():
+    from app.inference.gemini_predictor import _ChecklistWeightStore
+    weight = _ChecklistWeightStore.get()
+    return {"weight": weight, "remaining": 100 - weight}
+
+
+@app.put("/admin/checklist-weight")
+async def set_checklist_weight(req: ChecklistWeightRequest):
+    from app.inference.gemini_predictor import _ChecklistWeightStore
+    _ChecklistWeightStore.set(req.weight)
+    logger.info("Admin checklist weight updated to {}%", req.weight)
+    return {"status": "ok", "weight": req.weight, "remaining": 100 - req.weight}
 
 
 # ── Prediction analysis endpoint ──────────────────────────────────────────────
