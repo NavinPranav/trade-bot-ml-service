@@ -55,6 +55,20 @@ class Settings(BaseSettings):
     gemini_sell_near_support_min_confidence: float = 72.0
     # If > 0: force HOLD when ATR(14)/price*100 is below this (very dead tape). 0 = disabled.
     gemini_min_atr_pct_of_price: float = 0.0
+    # Multi-timeframe trend guardrail: veto BUY in DOWNTREND / SELL in UPTREND.
+    # Combines a primary (5m) and higher (15m) regime label computed deterministically
+    # from raw OHLCV (EMA stack, intraday VWAP, swing structure, regression slope).
+    gemini_trend_guardrail_enabled: bool = True
+    # Reversal-confirmation override for the trend guardrail. Score (0-5) is the
+    # count of: engulfing/hammer pattern, volume spike >=1.3x, RSI in turnaround
+    # zone, VWAP reclaim/loss. When score >= this threshold, a counter-trend
+    # BUY/SELL is allowed through the guardrail with an annotated reason.
+    # Set to a very high number (e.g. 99) to disable the override entirely.
+    gemini_reversal_confirmation_min_signals: int = 3
+    # Volume confirmation gate: force HOLD when last-bar volume / 20-bar avg is
+    # below this ratio. 0.0 = disabled (default — opt-in because thin-tape data
+    # quality varies by symbol). Typical opt-in value: 0.7.
+    gemini_volume_confirmation_min_ratio: float = 0.0
 
     # Live predict: retries on HTTP 429 before HOLD placeholder (same idea as /admin/analyse).
     gemini_429_max_retries: int = 4

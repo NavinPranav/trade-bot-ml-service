@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
 import httpx
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -54,7 +55,7 @@ def _resolve_realtime(
     return {"price": 0.0, "change": 0.0, "change_pct": 0.0}
 
 
-def _ohlcv_tail_records(ohlcv: pd.DataFrame, max_rows: int = 60) -> list[dict[str, Any]]:
+def _ohlcv_tail_records(ohlcv: pd.DataFrame, max_rows: int = 120) -> list[dict[str, Any]]:
     tail = ohlcv.tail(max_rows)
     rows: list[dict[str, Any]] = []
     for idx, row in tail.iterrows():
@@ -165,6 +166,404 @@ def _compute_indicator_snapshot(ohlcv: pd.DataFrame) -> dict[str, Any]:
     return snap
 
 
+# ── Deterministic multi-timeframe trend detector ────────────────────────────
+#
+# The Gemini prompt sometimes emits BUY in a clear downtrend (or SELL in a clear
+# uptrend) because it overweights short-term reversal patterns / mean-reversion
+# cues. This module computes a model-free regime label from raw OHLCV using a
+# scoring system and exposes a guardrail that vetoes counter-trend directional
+# calls when both the primary (5m) and the higher (15m) timeframe agree.
+
+_TREND_SCORE_THRESHOLD = 3
+_TREND_MIN_BARS = 30
+_TREND_INTRADAY_VWAP_BARS = 75   # approx one IST trading day on 5-minute bars
+_TREND_REGRESSION_BARS = 30
+_TREND_SWING_SEGMENT = 5         # last/prior 5-bar segments for higher-high / lower-low
+_TREND_VWAP_DEVIATION_BPS = 0.05  # +/- 0.05 % away from VWAP counts as above/below
+
+
+def _last_float(series: pd.Series) -> float | None:
+    if series is None or series.empty:
+        return None
+    v = series.iloc[-1]
+    if pd.isna(v):
+        return None
+    return float(v)
+
+
+def _ema_local(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _normalised_slope(series: pd.Series, lookback: int = 5) -> float:
+    """Last value vs `lookback` bars ago, normalised by the older value (returns a fraction)."""
+    if series is None or len(series) < lookback + 1:
+        return 0.0
+    earlier = float(series.iloc[-lookback - 1])
+    latest = float(series.iloc[-1])
+    base = abs(earlier) or 1.0
+    return (latest - earlier) / base
+
+
+def _intraday_vwap_value(ohlcv: pd.DataFrame) -> float | None:
+    """Volume-weighted average price using the last ~75 bars (≈ one trading day on 5m)."""
+    try:
+        if ohlcv is None or ohlcv.empty or "volume" not in ohlcv.columns:
+            return None
+        tail = ohlcv.tail(_TREND_INTRADAY_VWAP_BARS)
+        vol = tail["volume"].astype(float)
+        if vol.sum() <= 0:
+            return None
+        typical = (
+            tail["high"].astype(float)
+            + tail["low"].astype(float)
+            + tail["close"].astype(float)
+        ) / 3.0
+        return float((typical * vol).sum() / vol.sum())
+    except Exception:
+        return None
+
+
+def _swing_structure_score(ohlcv: pd.DataFrame, segment: int = _TREND_SWING_SEGMENT) -> int:
+    """+1 for higher-highs+higher-lows, -1 for lower-highs+lower-lows, 0 otherwise."""
+    if ohlcv is None or len(ohlcv) < 2 * segment:
+        return 0
+    recent = ohlcv.tail(segment)
+    prior = ohlcv.iloc[-(2 * segment):-segment]
+    if recent.empty or prior.empty:
+        return 0
+    rec_high = float(recent["high"].max())
+    rec_low = float(recent["low"].min())
+    pri_high = float(prior["high"].max())
+    pri_low = float(prior["low"].min())
+    if rec_high > pri_high and rec_low > pri_low:
+        return 1
+    if rec_high < pri_high and rec_low < pri_low:
+        return -1
+    return 0
+
+
+def _detect_trend_single_tf(ohlcv: pd.DataFrame) -> dict[str, Any]:
+    """Score-based regime detector for a single timeframe.
+
+    Returns ``{regime, score, reasons, evidence}`` where ``regime`` is one of
+    ``UPTREND`` / ``DOWNTREND`` / ``SIDEWAYS`` / ``UNKNOWN``. Pure pandas/numpy
+    so it stays fast and dependency-free.
+    """
+    if ohlcv is None or ohlcv.empty or len(ohlcv) < _TREND_MIN_BARS:
+        return {"regime": "UNKNOWN", "score": 0, "reasons": [], "evidence": {"bars": 0 if ohlcv is None else len(ohlcv)}}
+
+    close = ohlcv["close"].astype(float)
+    last_close = float(close.iloc[-1])
+
+    score = 0
+    reasons: list[str] = []
+    evidence: dict[str, Any] = {"bars": int(len(ohlcv)), "last_close": round(last_close, 2)}
+
+    # 1) EMA stack + EMA50 slope (strongest single signal).
+    ema9 = _ema_local(close, 9)
+    ema21 = _ema_local(close, 21)
+    ema50 = _ema_local(close, 50) if len(close) >= 50 else None
+    e9 = _last_float(ema9)
+    e21 = _last_float(ema21)
+    e50 = _last_float(ema50) if ema50 is not None else None
+    if e9 is not None and e21 is not None:
+        evidence["ema_9"] = round(e9, 2)
+        evidence["ema_21"] = round(e21, 2)
+    if e50 is not None:
+        evidence["ema_50"] = round(e50, 2)
+        slope_50 = _normalised_slope(ema50, lookback=5)
+        evidence["ema_50_slope_pct"] = round(slope_50 * 100, 4)
+        if e9 is not None and e21 is not None:
+            if e9 > e21 > e50 and slope_50 >= 0:
+                score += 2
+                reasons.append("EMA stack bullish (EMA9>EMA21>EMA50) with EMA50 sloping up")
+            elif e9 < e21 < e50 and slope_50 <= 0:
+                score -= 2
+                reasons.append("EMA stack bearish (EMA9<EMA21<EMA50) with EMA50 sloping down")
+    elif e9 is not None and e21 is not None:
+        # Fallback when not enough bars for EMA50.
+        if e9 > e21:
+            score += 1
+            reasons.append("EMA9 above EMA21 (EMA50 unavailable)")
+        elif e9 < e21:
+            score -= 1
+            reasons.append("EMA9 below EMA21 (EMA50 unavailable)")
+
+    # 2) Price vs intraday VWAP (institutional bias proxy).
+    vwap = _intraday_vwap_value(ohlcv)
+    if vwap and vwap > 0:
+        evidence["vwap"] = round(vwap, 2)
+        deviation_pct = (last_close - vwap) / vwap * 100
+        evidence["price_vs_vwap_pct"] = round(deviation_pct, 3)
+        if deviation_pct > _TREND_VWAP_DEVIATION_BPS:
+            score += 1
+            reasons.append("Price above intraday VWAP")
+        elif deviation_pct < -_TREND_VWAP_DEVIATION_BPS:
+            score -= 1
+            reasons.append("Price below intraday VWAP")
+
+    # 3) Swing structure: HH/HL vs LH/LL.
+    swing = _swing_structure_score(ohlcv)
+    evidence["swing_structure"] = swing
+    if swing > 0:
+        score += 1
+        reasons.append("Higher-highs and higher-lows over last 5 bars")
+    elif swing < 0:
+        score -= 1
+        reasons.append("Lower-highs and lower-lows over last 5 bars")
+
+    # 4) Linear regression slope of last 30 closes (catches gradual drifts EMAs can lag).
+    try:
+        seg = close.tail(_TREND_REGRESSION_BARS).reset_index(drop=True)
+        if len(seg) >= 10:
+            xs = np.arange(len(seg), dtype=float)
+            slope, _intercept = np.polyfit(xs, seg.to_numpy(dtype=float), 1)
+            base = abs(float(seg.iloc[0])) or 1.0
+            slope_pct_per_bar = (slope / base) * 100
+            evidence["regression_slope_pct_per_bar"] = round(slope_pct_per_bar, 4)
+            if slope_pct_per_bar > 0.01:
+                score += 1
+                reasons.append("Positive regression slope on last 30 closes")
+            elif slope_pct_per_bar < -0.01:
+                score -= 1
+                reasons.append("Negative regression slope on last 30 closes")
+    except Exception:
+        pass
+
+    if score >= _TREND_SCORE_THRESHOLD:
+        regime = "UPTREND"
+    elif score <= -_TREND_SCORE_THRESHOLD:
+        regime = "DOWNTREND"
+    else:
+        regime = "SIDEWAYS"
+
+    return {"regime": regime, "score": int(score), "reasons": reasons, "evidence": evidence}
+
+
+def _resample_to_higher_tf(ohlcv: pd.DataFrame, rule: str = "15min") -> pd.DataFrame:
+    """Resample 5-minute OHLCV to a higher timeframe; returns empty frame on failure."""
+    try:
+        if ohlcv is None or ohlcv.empty:
+            return pd.DataFrame()
+        if not isinstance(ohlcv.index, pd.DatetimeIndex):
+            return pd.DataFrame()
+        agg: dict[str, str] = {"open": "first", "high": "max", "low": "min", "close": "last"}
+        if "volume" in ohlcv.columns:
+            agg["volume"] = "sum"
+        return ohlcv.resample(rule).agg(agg).dropna(subset=["close"])
+    except Exception:
+        return pd.DataFrame()
+
+
+def _detect_trend_context(ohlcv: pd.DataFrame) -> dict[str, Any]:
+    """Multi-timeframe trend assessment: primary (raw) + higher (15m resample).
+
+    The combined ``regime`` is the primary timeframe regime, demoted to
+    ``SIDEWAYS`` whenever the two timeframes disagree directionally — this is
+    what feeds the post-AI guardrail.
+    """
+    primary = _detect_trend_single_tf(ohlcv)
+    higher_df = _resample_to_higher_tf(ohlcv, rule="15min")
+    higher = _detect_trend_single_tf(higher_df) if not higher_df.empty else {
+        "regime": "UNKNOWN", "score": 0, "reasons": [], "evidence": {"bars": 0},
+    }
+
+    primary_regime = primary.get("regime") or "UNKNOWN"
+    higher_regime = higher.get("regime") or "UNKNOWN"
+
+    agreement = (
+        primary_regime == higher_regime
+        and primary_regime in ("UPTREND", "DOWNTREND")
+    )
+    combined = primary_regime
+    if (
+        primary_regime in ("UPTREND", "DOWNTREND")
+        and higher_regime in ("UPTREND", "DOWNTREND")
+        and primary_regime != higher_regime
+    ):
+        combined = "SIDEWAYS"
+
+    return {
+        "regime": combined,
+        "primary_regime": primary_regime,
+        "higher_regime": higher_regime,
+        "agreement": agreement,
+        "primary_score": int(primary.get("score") or 0),
+        "higher_score": int(higher.get("score") or 0),
+        "primary_reasons": primary.get("reasons") or [],
+        "higher_reasons": higher.get("reasons") or [],
+        "evidence": {
+            "primary": primary.get("evidence") or {},
+            "higher": higher.get("evidence") or {},
+        },
+    }
+
+
+def _detect_reversal_confirmation(
+    ohlcv: pd.DataFrame,
+    indicators: Optional[dict[str, Any]],
+    direction: str,
+) -> dict[str, Any]:
+    """Score deterministic counter-trend reversal evidence for a directional call.
+
+    Returns ``{"confirmed": bool, "score": int, "reasons": [...]}``. ``confirmed``
+    becomes ``True`` once the score crosses the ``reversal_confirmation_min_signals``
+    policy threshold. Used to override the trend guardrail when a genuine reversal
+    is unfolding (e.g. bullish engulfing on a volume spike at the end of a downtrend).
+
+    All checks are pure pandas/numpy. No ``ta`` import here — we read the
+    pre-computed RSI / volume_ratio out of the indicator snapshot.
+    """
+    out: dict[str, Any] = {"confirmed": False, "score": 0, "reasons": [], "evidence": {}}
+    if direction not in ("BUY", "SELL"):
+        return out
+    if ohlcv is None or len(ohlcv) < 2:
+        return out
+
+    last = ohlcv.iloc[-1]
+    prev = ohlcv.iloc[-2]
+    try:
+        o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+        po, _ph, _pl, pc = float(prev["open"]), float(prev["high"]), float(prev["low"]), float(prev["close"])
+    except (KeyError, TypeError, ValueError):
+        return out
+    body = abs(c - o)
+    safe_body = max(body, 1e-6)
+
+    score = 0
+    reasons: list[str] = []
+    evidence: dict[str, Any] = {"last_close": round(c, 2), "prev_close": round(pc, 2)}
+
+    rsi_val = (indicators or {}).get("rsi_14")
+    vol_ratio = (indicators or {}).get("volume_ratio")
+    vwap = _intraday_vwap_value(ohlcv)
+    if vwap is not None:
+        evidence["vwap"] = round(vwap, 2)
+    if rsi_val is not None:
+        evidence["rsi_14"] = rsi_val
+    if vol_ratio is not None:
+        evidence["volume_ratio"] = vol_ratio
+
+    if direction == "BUY":
+        # 1) Bullish engulfing — last bar is green, prev red, body engulfs prev body.
+        if c > o and pc < po and c >= po and o <= pc:
+            score += 1
+            reasons.append("Bullish engulfing pattern")
+        # 2) Hammer / pin bar — long lower wick, small upper wick, bull-ish body.
+        lower_wick = (o - l) if c >= o else (c - l)
+        upper_wick = (h - c) if c >= o else (h - o)
+        if lower_wick > 2.0 * safe_body and upper_wick < safe_body and c >= o:
+            score += 1
+            reasons.append("Hammer-style lower wick")
+        # 3) Volume spike — buyers stepping in.
+        try:
+            if vol_ratio is not None and float(vol_ratio) >= 1.3:
+                score += 1
+                reasons.append(f"Volume {float(vol_ratio):.2f}x average")
+        except (TypeError, ValueError):
+            pass
+        # 4) RSI rising from oversold zone — momentum turning up.
+        try:
+            if rsi_val is not None and 35 <= float(rsi_val) <= 55:
+                score += 1
+                reasons.append(f"RSI {float(rsi_val):.1f} rising from oversold")
+        except (TypeError, ValueError):
+            pass
+        # 5) VWAP reclaim — last close back above VWAP, prev close was below.
+        if vwap is not None and pc < vwap and c >= vwap:
+            score += 1
+            reasons.append("Reclaimed VWAP from below")
+    else:  # SELL
+        if c < o and pc > po and c <= po and o >= pc:
+            score += 1
+            reasons.append("Bearish engulfing pattern")
+        upper_wick = (h - o) if c <= o else (h - c)
+        lower_wick = (o - l) if c <= o else (c - l)
+        if upper_wick > 2.0 * safe_body and lower_wick < safe_body and c <= o:
+            score += 1
+            reasons.append("Shooting-star upper wick")
+        try:
+            if vol_ratio is not None and float(vol_ratio) >= 1.3:
+                score += 1
+                reasons.append(f"Volume {float(vol_ratio):.2f}x average")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if rsi_val is not None and 45 <= float(rsi_val) <= 65:
+                score += 1
+                reasons.append(f"RSI {float(rsi_val):.1f} falling from overbought")
+        except (TypeError, ValueError):
+            pass
+        if vwap is not None and pc > vwap and c <= vwap:
+            score += 1
+            reasons.append("Lost VWAP from above")
+
+    try:
+        required = max(1, int(_policy("reversal_confirmation_min_signals")))
+    except (KeyError, TypeError, ValueError):
+        required = 3
+
+    out.update({
+        "confirmed": score >= required,
+        "score": int(score),
+        "reasons": reasons,
+        "evidence": evidence,
+        "required_signals": int(required),
+    })
+    return out
+
+
+def _apply_trend_guardrail(
+    direction: str,
+    trend_context: Optional[dict[str, Any]],
+    reversal: Optional[dict[str, Any]] = None,
+) -> tuple[str, Optional[str]]:
+    """Veto BUY in a downtrend / SELL in an uptrend, unless reversal evidence overrides.
+
+    Returns ``(final_direction, downgrade_reason_or_None)``. The veto is
+    deliberately strict: if any of {primary, higher, combined} timeframes
+    explicitly disagrees with the directional call we coerce to HOLD. SIDEWAYS
+    or UNKNOWN never triggers the veto on its own — the existing confidence /
+    R:R / dead-tape gates already cover those.
+
+    When ``reversal["confirmed"]`` is ``True`` the veto is skipped and the
+    directional call is allowed through. The caller is responsible for
+    annotating ``prediction_reason`` so the user can see both the regime
+    mismatch and the reversal evidence that justified passing through.
+    """
+    if direction not in ("BUY", "SELL"):
+        return direction, None
+    if not trend_context:
+        return direction, None
+
+    combined = trend_context.get("regime") or "UNKNOWN"
+    primary = trend_context.get("primary_regime") or "UNKNOWN"
+    higher = trend_context.get("higher_regime") or "UNKNOWN"
+
+    opposing_label = "DOWNTREND" if direction == "BUY" else "UPTREND"
+    opposing = {combined, primary, higher} & {opposing_label}
+    if not opposing:
+        return direction, None
+
+    if reversal and reversal.get("confirmed"):
+        # Pass-through allowed. We still annotate so the operator sees both sides.
+        score = reversal.get("score", 0)
+        reasons = ", ".join(reversal.get("reasons") or []) or "pattern + indicator confluence"
+        note = (
+            f"{direction} allowed despite {opposing_label} regime "
+            f"(combined={combined}, primary={primary}, higher={higher}) — "
+            f"reversal confirmation score={score}: {reasons}"
+        )
+        return direction, note
+
+    veto = (
+        f"{direction} vetoed by trend guardrail — combined={combined}, "
+        f"primary(5m)={primary}, higher(15m)={higher}"
+    )
+    return "HOLD", veto
+
+
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are an elite intra-day Bank Nifty trader and options analyst with 15 years of experience trading Indian derivatives. You specialize in reading price action, order flow, and volatility to predict short-term moves.
 
@@ -192,25 +591,45 @@ LAST 5 COMPLETED CANDLES (5-min, newest first):
 
 YOUR TASK:
 Predict what Bank Nifty will do in the NEXT {target_minutes} MINUTES.
+You are also given recent_ohlcv_bars in the user payload: use the full raw window (normally the latest 120 bars)
+to judge trend persistence, pullbacks, breakouts, and lower-high/lower-low or higher-high/higher-low structure.
+
+TREND CONTEXT (deterministic, multi-timeframe):
+The user payload contains a trend_context object computed directly from OHLCV with keys:
+regime (combined), primary_regime (5-min), higher_regime (15-min), agreement (bool),
+primary_score, higher_score (each in roughly −5..+5), and reasons describing why each
+timeframe is labelled UPTREND / DOWNTREND / SIDEWAYS / UNKNOWN. Treat this as a hard
+prior: if higher_regime is DOWNTREND, do not output BUY unless you have very strong
+reversal confirmation (e.g., bullish engulfing on heavy volume + RSI cross up from
+oversold + reclaim of VWAP). The same applies in reverse for SELL in an UPTREND.
+A post-AI guardrail in the service will downgrade BUY-in-DOWNTREND or SELL-in-UPTREND
+to HOLD unless deterministic reversal evidence (engulfing/hammer + volume spike + RSI
+zone turn + VWAP reclaim) is present, so do not emit speculative counter-trend calls.
+
+VOLUME CONFIRMATION:
+A separate post-AI gate may force HOLD when last-bar volume vs the 20-bar average is
+below the configured ratio (default disabled). When you see volume_ratio < 0.7 in the
+indicators payload, treat the move as low-conviction and lean toward HOLD or, at minimum,
+reduce confidence by 10 points so the existing floor catches it.
 
 THINK THROUGH THIS STEP BY STEP BEFORE ANSWERING:
 1. TREND: Is EMA 20 above or below EMA 50? What is the slope — widening or narrowing?
 2. MOMENTUM: Is RSI overbought (>70), oversold (<30), or in the buy zone (55-70) / sell zone (30-45) / neutral (45-55)?
 3. PRICE vs VWAP: Is price above VWAP (institutional buying) or below (selling)? How far from VWAP?
 4. CANDLE PATTERN: Are the last 5 candles making higher highs (bullish) or lower lows (bearish)? Any reversal patterns (doji, hammer, engulfing)?
-5. OPTIONS DATA: PCR > 1.2 is bullish (put writers confident), PCR < 0.8 is bearish. Is max pain above or below spot?
+5. OPTIONS DATA: PCR > 1.2 is bullish (put writers confident), PCR < 0.8 is bearish. If PCR/max pain are N/A, ignore this factor instead of treating it as bearish, neutral, or a HOLD reason.
 6. VOLATILITY: Is VIX rising (expect bigger move) or falling (expect range)? Use ATR to size stop loss realistically.
 7. SUPPORT/RESISTANCE: Is price near any key level? A bounce off support = BUY, rejection at resistance = SELL, breakout = strong move.
 8. TIME OF DAY: 9:15-9:30 = volatile/unreliable, 12:00-13:00 = low volume/choppy, 14:00-15:15 = trend resumes. Adjust confidence based on time.
 9. VOLUME: Volume > 1.5x average = conviction in the move. Volume < 0.7x = low conviction, prefer HOLD.
-10. CONFLUENCE: Count how many of the above agree. BUY/SELL only with 4+ signals aligned. Otherwise HOLD.
+10. CONFLUENCE: Count only available, non-N/A signals. For a clear directional market, BUY/SELL is valid with 3+ aligned signals when trend + price-vs-VWAP + momentum/candles agree. Use HOLD for conflict, chop, poor R:R, or true low confidence — not merely because one optional signal is unavailable.
 
 STRICT RULES:
 1. If confidence < {min_confidence} → direction MUST be "HOLD". No exceptions.
 2. Risk-reward must be >= {min_risk_reward} for BUY or SELL. If ATR doesn't support a 1:{min_risk_reward} R:R within {target_minutes} minutes, use HOLD.
 3. stop_loss must be realistic — use 0.3x to 0.5x ATR from entry. Never equal to entry or target.
 4. target_price must be realistic — use 0.5x to 1.0x ATR from entry in the predicted direction.
-5. If RSI is between 45-55 AND price is within 0.1% of VWAP → this is a NO TRADE zone → HOLD.
+5. If RSI is between 45-55 AND price is within 0.1% of VWAP AND candles are not trending → this is a NO TRADE zone → HOLD.
 6. If only 15 minutes remain before market close (after 15:15 IST) → HOLD.
 7. If VIX > 20 → widen stop loss by 1.5x and reduce confidence by 10.
 8. magnitude = expected % move (positive for BUY, negative for SELL, 0 for HOLD).
@@ -220,7 +639,7 @@ STRICT RULES:
 CONFIDENCE CALIBRATION:
 - 90-100%: All 10 signals aligned + strong candle pattern + high volume breakout (extremely rare)
 - 75-89%: 7-8 signals aligned + clear trend + good volume
-- 65-74%: 5-6 signals aligned + moderate conviction
+- 65-74%: 3-6 available signals aligned + moderate directional conviction
 - Below {min_confidence}%: Not enough confluence → MUST output HOLD
 
 Respond with ONE JSON object only. No markdown, no backticks, no explanation outside the JSON.
@@ -303,6 +722,9 @@ class _PredictionPolicyStore:
         "min_atr_pct_of_price": "gemini_min_atr_pct_of_price",
         "rate_limit_max_retries": "gemini_429_max_retries",
         "rate_limit_retry_base_delay_sec": "gemini_429_retry_base_delay_sec",
+        "trend_guardrail_enabled": "gemini_trend_guardrail_enabled",
+        "reversal_confirmation_min_signals": "gemini_reversal_confirmation_min_signals",
+        "volume_confirmation_min_ratio": "gemini_volume_confirmation_min_ratio",
     }
 
     _CAMEL: dict[str, str] = {
@@ -314,6 +736,9 @@ class _PredictionPolicyStore:
         "min_atr_pct_of_price": "minAtrPctOfPrice",
         "rate_limit_max_retries": "rateLimitMaxRetries",
         "rate_limit_retry_base_delay_sec": "rateLimitRetryBaseDelaySec",
+        "trend_guardrail_enabled": "trendGuardrailEnabled",
+        "reversal_confirmation_min_signals": "reversalConfirmationMinSignals",
+        "volume_confirmation_min_ratio": "volumeConfirmationMinRatio",
     }
 
     @classmethod
@@ -330,11 +755,17 @@ class _PredictionPolicyStore:
         for k, v in updates.items():
             if k not in cls._SETTINGS_ATTR or v is None:
                 continue
-            if k == "rate_limit_max_retries":
+            if k in ("rate_limit_max_retries", "reversal_confirmation_min_signals"):
                 v = int(v)
+            elif k == "trend_guardrail_enabled":
+                if isinstance(v, str):
+                    v = v.strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    v = bool(v)
             elif k in ("min_confidence", "min_risk_reward", "strong_trend_min_ema_gap_pct",
                        "relaxed_confidence_floor_strong_trend", "sell_near_support_min_confidence",
-                       "min_atr_pct_of_price", "rate_limit_retry_base_delay_sec"):
+                       "min_atr_pct_of_price", "rate_limit_retry_base_delay_sec",
+                       "volume_confirmation_min_ratio"):
                 v = float(v)
             cls._overrides[k] = v
 
@@ -589,15 +1020,40 @@ def _strong_trend_from_indicators(indicators: dict[str, Any], price: float) -> b
     return gap_pct >= float(_policy("strong_trend_min_ema_gap_pct"))
 
 
+def _is_with_trend(model_direction: str, trend_context: Optional[dict[str, Any]]) -> bool:
+    """True when a directional call agrees with the combined multi-timeframe regime."""
+    if not trend_context or model_direction not in ("BUY", "SELL"):
+        return False
+    regime = trend_context.get("regime")
+    if model_direction == "BUY" and regime == "UPTREND":
+        return True
+    if model_direction == "SELL" and regime == "DOWNTREND":
+        return True
+    return False
+
+
 def _effective_confidence_floor(
     model_direction: str,
     indicators: Optional[dict[str, Any]],
     checklist_signal: Optional[dict[str, Any]],
     price: float,
+    trend_context: Optional[dict[str, Any]] = None,
 ) -> float:
-    """Minimum confidence required before coercing non-HOLD to HOLD."""
+    """Minimum confidence required before coercing non-HOLD to HOLD.
+
+    Two relaxation paths into ``relaxed_confidence_floor_strong_trend``:
+    - **EMA gap proxy** (legacy): EMA9 vs EMA21 separation is wide.
+    - **Regime agreement** (new): the deterministic multi-timeframe regime
+      matches the directional call. This is the more robust path because it
+      requires confirmation across two timeframes plus VWAP and swing
+      structure, not just one EMA pair.
+    """
     floor = float(_policy("min_confidence"))
-    if indicators and price > 0 and _strong_trend_from_indicators(indicators, price):
+    is_strong_via_ema = bool(
+        indicators and price > 0 and _strong_trend_from_indicators(indicators, price)
+    )
+    is_with_trend_via_regime = _is_with_trend(model_direction, trend_context)
+    if is_strong_via_ema or is_with_trend_via_regime:
         floor = float(_policy("relaxed_confidence_floor_strong_trend"))
     step5 = (checklist_signal or {}).get("step5_levels") or {}
     if (
@@ -630,11 +1086,15 @@ def _coerce_result(
     *,
     indicators: Optional[dict[str, Any]] = None,
     checklist_signal: Optional[dict[str, Any]] = None,
+    trend_context: Optional[dict[str, Any]] = None,
+    ohlcv: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     # Model output before policy (confidence / R:R). Used so entry/SL/target in history
     # still reflect what Gemini predicted even when we downgrade the tradable signal to HOLD.
     model_direction = _normalize_direction(raw)
     direction = model_direction
+    trend_guardrail_reason: Optional[str] = None
+    volume_gate_reason: Optional[str] = None
 
     def _f(key: str, default: float = 0.0) -> float:
         try:
@@ -657,7 +1117,7 @@ def _coerce_result(
         direction = "HOLD"
 
     eff_floor = _effective_confidence_floor(
-        model_direction, indicators, checklist_signal, realtime_price
+        model_direction, indicators, checklist_signal, realtime_price, trend_context
     )
     if confidence < eff_floor and model_direction != "HOLD":
         logger.info(
@@ -703,6 +1163,69 @@ def _coerce_result(
         )
         direction = "HOLD"
 
+    # Volume confirmation gate: reject BUY/SELL when last-bar volume vs 20-bar avg is
+    # below the configured ratio. Default threshold is 0.0 (disabled) so this is
+    # opt-in. Indicators contain the pre-computed `volume_ratio` so we don't need OHLCV.
+    if direction in ("BUY", "SELL") and indicators is not None:
+        try:
+            min_vol_ratio = float(_policy("volume_confirmation_min_ratio"))
+        except (KeyError, TypeError, ValueError):
+            min_vol_ratio = 0.0
+        vol_ratio = indicators.get("volume_ratio")
+        if min_vol_ratio > 0 and vol_ratio is not None:
+            try:
+                vr = float(vol_ratio)
+            except (TypeError, ValueError):
+                vr = None
+            if vr is not None and vr < min_vol_ratio:
+                logger.info(
+                    "Volume confirmation failed — {:.2f}x < {:.2f}x — overriding {} → HOLD",
+                    vr,
+                    min_vol_ratio,
+                    direction,
+                )
+                volume_gate_reason = (
+                    f"{direction} blocked by volume confirmation gate — "
+                    f"{vr:.2f}x average < {min_vol_ratio:.2f}x required"
+                )
+                direction = "HOLD"
+
+    # Reversal-confirmation evidence (used as override for the trend guardrail).
+    # Computed only for directional calls and only when we have OHLCV — otherwise
+    # we leave the guardrail as a hard veto.
+    reversal_info: Optional[dict[str, Any]] = None
+    if direction in ("BUY", "SELL") and ohlcv is not None:
+        try:
+            reversal_info = _detect_reversal_confirmation(ohlcv, indicators, direction)
+        except Exception as e:
+            logger.warning("Reversal confirmation check failed: {}", e)
+            reversal_info = None
+
+    # Trend guardrail: veto BUY in a downtrend / SELL in an uptrend (multi-timeframe).
+    # Runs after the other gates so the log line stays meaningful (we only veto signals
+    # that would otherwise pass confidence + R:R + dead-tape checks). Reversal
+    # confirmation can override the veto with an annotated reason.
+    try:
+        guardrail_on = bool(_policy("trend_guardrail_enabled"))
+    except KeyError:
+        guardrail_on = True
+    if guardrail_on and direction in ("BUY", "SELL"):
+        new_direction, reason = _apply_trend_guardrail(direction, trend_context, reversal_info)
+        if new_direction != direction:
+            logger.info(
+                "Trend guardrail tripped — overriding {} → {} ({})",
+                direction,
+                new_direction,
+                reason,
+            )
+            direction = new_direction
+            trend_guardrail_reason = reason
+        elif reason and reversal_info and reversal_info.get("confirmed"):
+            # Same direction but the guardrail had an opposing regime; reversal override
+            # let it through. Surface this in prediction_reason for transparency.
+            logger.info("Trend guardrail bypassed by reversal confirmation: {}", reason)
+            trend_guardrail_reason = reason
+
     # Testing / QA: always expose numeric SL and TP for HOLD (incl. low-confidence / no-trade),
     # so UI and history rows always show a bracket. Uses symmetric ±0.3% around entry when
     # levels are missing or target collapsed to entry (spot).
@@ -731,6 +1254,15 @@ def _coerce_result(
 
     reason_raw = raw.get("reason") or raw.get("rationale") or raw.get("explanation") or ""
     reason = str(reason_raw).strip()[:4000]
+    prefixes: list[str] = []
+    if volume_gate_reason:
+        prefixes.append(f"[Volume gate] {volume_gate_reason}")
+    if trend_guardrail_reason:
+        prefixes.append(f"[Trend guardrail] {trend_guardrail_reason}")
+    if prefixes:
+        head = " ".join(prefixes)
+        reason = f"{head} | Original model rationale: {reason}" if reason else head
+        reason = reason[:4000]
 
     out: Dict[str, Any] = {
         "direction": direction,
@@ -799,6 +1331,24 @@ class GeminiPredictor:
         # Compute technical indicators for the current bar
         indicators = _compute_indicator_snapshot(ohlcv)
 
+        # Deterministic multi-timeframe trend regime (used by both the prompt
+        # and the post-AI guardrail to suppress counter-trend BUY/SELL).
+        try:
+            trend_context = _detect_trend_context(ohlcv)
+        except Exception as e:
+            logger.warning("Trend context computation failed: {}", e)
+            trend_context = {
+                "regime": "UNKNOWN",
+                "primary_regime": "UNKNOWN",
+                "higher_regime": "UNKNOWN",
+                "agreement": False,
+                "primary_score": 0,
+                "higher_score": 0,
+                "primary_reasons": [],
+                "higher_reasons": [],
+                "evidence": {"primary": {}, "higher": {}, "error": str(e)},
+            }
+
         checklist_weight = _ChecklistWeightStore.get()
         try:
             checklist_signal = run_checklist(ohlcv)
@@ -827,6 +1377,7 @@ class GeminiPredictor:
             "india_vix": _vix_tail_summary(vix),
             "checklist_signal": checklist_signal,
             "news_sentiment": news_sentiment,
+            "trend_context": trend_context,
         }
         user_text = json.dumps(user_payload, default=str)
 
@@ -900,6 +1451,9 @@ class GeminiPredictor:
                         "reason": "Gemini rate limit hit (HTTP 429) — HOLD placeholder, not a model forecast.",
                     },
                     float(realtime["price"]),
+                    indicators=indicators,
+                    trend_context=trend_context,
+                    ohlcv=ohlcv,
                 )
 
             if resp.status_code in _GEMINI_RETRYABLE_HTTP:
@@ -912,6 +1466,9 @@ class GeminiPredictor:
                         "reason": "Gemini capacity error (HTTP 502/503) — HOLD placeholder.",
                     },
                     float(realtime["price"]),
+                    indicators=indicators,
+                    trend_context=trend_context,
+                    ohlcv=ohlcv,
                 )
 
             if resp.status_code >= 400:
@@ -933,6 +1490,8 @@ class GeminiPredictor:
             float(realtime["price"]),
             indicators=indicators,
             checklist_signal=checklist_signal,
+            trend_context=trend_context,
+            ohlcv=ohlcv,
         )
 
         logger.info(

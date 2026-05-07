@@ -298,6 +298,21 @@ def _validate_prediction_policy_patch(p: Dict[str, Any]) -> List[str]:
                 errs.append("rate_limit_retry_base_delay_sec must be 1–120")
         except (TypeError, ValueError):
             errs.append("rate_limit_retry_base_delay_sec must be a number")
+    if "trend_guardrail_enabled" in p:
+        v = p["trend_guardrail_enabled"]
+        if isinstance(v, str):
+            if v.strip().lower() not in ("1", "0", "true", "false", "yes", "no", "on", "off"):
+                errs.append("trend_guardrail_enabled must be a boolean")
+        elif not isinstance(v, (bool, int)):
+            errs.append("trend_guardrail_enabled must be a boolean")
+    if "reversal_confirmation_min_signals" in p:
+        try:
+            x = int(p["reversal_confirmation_min_signals"])
+            if x < 1 or x > 99:
+                errs.append("reversal_confirmation_min_signals must be 1–99")
+        except (TypeError, ValueError):
+            errs.append("reversal_confirmation_min_signals must be an integer")
+    _f("volume_confirmation_min_ratio", 0.0, 10.0)
     return errs
 
 
