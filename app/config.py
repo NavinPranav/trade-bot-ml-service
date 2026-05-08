@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Dict
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -34,7 +35,21 @@ class Settings(BaseSettings):
     market_close: str = "15:30"
     timezone: str = "Asia/Kolkata"
     # Minimum bars required. Intra-day 1M/5M feeds accumulate quickly; 30 bars covers ~30 min of 1M data.
+    # NOTE: this is the *floor*; per-horizon thresholds (`min_ohlcv_bars_by_horizon`) override it
+    # so that 15M predictions cannot run on a 5-bar payload, etc.
     min_ohlcv_bars_grpc: int = 30
+    # Per-horizon minimum bars. Set generous floors for intraday horizons so the AI/indicators
+    # always have enough context (EMA50 needs 50, ATR14 needs 14, regression slope needs ~30, etc.).
+    # Override via env: SENSEX_MIN_OHLCV_BARS_BY_HORIZON='{"15M":120}'
+    min_ohlcv_bars_by_horizon: Dict[str, int] = {
+        "5M": 60,
+        "15M": 120,
+        "30M": 80,
+        "1H": 60,
+        "1D": 30,
+        "3D": 30,
+        "1W": 30,
+    }
 
     # Live tick stream → debounced inference (uses baseline OHLCV from last GetPrediction for that symbol).
     live_inference_enabled: bool = True

@@ -94,6 +94,147 @@ def _resolve_realtime(
     return {"price": 0.0, "change": 0.0, "change_pct": 0.0}
 
 
+def _ohlcv_quality_diagnostic(
+    ohlcv: pd.DataFrame, horizon: str
+) -> dict[str, Any]:
+    """
+    Inspects an OHLCV frame for the most common data-quality issues that produce
+    surprising indicator values (especially ATR):
+
+      * mixed timeframes (the broker stitched 1-min and 5-min candles together)
+      * absurd high/low ranges (high < low, high == low for many bars, etc.)
+      * stale data (last bar timestamp is hours old during market hours)
+      * tail vs full-history price gaps (suggests instrument switch / bad concat)
+
+    Returns a JSON-serialisable dict suitable for structured logging plus a list
+    of human-readable ``warnings`` strings for grep-friendly alerts.
+    """
+    out: dict[str, Any] = {
+        "horizon": horizon,
+        "bars": int(len(ohlcv)) if ohlcv is not None else 0,
+        "warnings": [],
+    }
+    if ohlcv is None or ohlcv.empty:
+        out["warnings"].append("empty_ohlcv")
+        return out
+
+    df = ohlcv
+
+    # 1) Bar interval consistency — a healthy 5M frame should have most diffs ≈ 300 s.
+    try:
+        if isinstance(df.index, pd.DatetimeIndex) and len(df) >= 3:
+            diffs = (
+                df.index.to_series().diff().dropna().dt.total_seconds().astype(int)
+            )
+            if not diffs.empty:
+                most_common = int(diffs.mode().iloc[0])
+                unique_diffs = sorted(diffs.unique().tolist())[:8]
+                # Filter out market-close-to-next-open jumps (>1 hour) which are normal.
+                intra_session = diffs[diffs <= 3600]
+                non_modal = (
+                    int((intra_session != most_common).sum())
+                    if not intra_session.empty
+                    else 0
+                )
+                out["bar_interval_seconds_modal"] = most_common
+                out["bar_interval_seconds_unique"] = unique_diffs
+                out["bar_interval_non_modal_count"] = non_modal
+                if non_modal > max(2, int(0.1 * len(intra_session))):
+                    out["warnings"].append(
+                        f"mixed_bar_intervals modal={most_common}s "
+                        f"non_modal_bars={non_modal}/{len(intra_session)}"
+                    )
+    except Exception:
+        pass
+
+    # 2) High/Low sanity.
+    try:
+        if {"high", "low"}.issubset(df.columns):
+            bad_hl = int(((df["high"] < df["low"])).sum())
+            flat_hl = int((df["high"] == df["low"]).sum())
+            out["bad_high_low_bars"] = bad_hl
+            out["flat_high_low_bars"] = flat_hl
+            if bad_hl > 0:
+                out["warnings"].append(f"high_lt_low_bars={bad_hl}")
+            if flat_hl > max(3, int(0.2 * len(df))):
+                out["warnings"].append(
+                    f"too_many_flat_bars high==low {flat_hl}/{len(df)}"
+                )
+    except Exception:
+        pass
+
+    # 3) ATR% snapshot (informational — if it’s out of a sensible band, flag it).
+    try:
+        if {"high", "low", "close"}.issubset(df.columns) and len(df) >= 14:
+            n = 14
+            high = df["high"].astype(float)
+            low = df["low"].astype(float)
+            close = df["close"].astype(float)
+            prev_close = close.shift(1)
+            tr = pd.concat(
+                [
+                    (high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            atr = float(tr.rolling(n).mean().iloc[-1])
+            last_close = float(close.iloc[-1])
+            atr_pct = (atr / last_close * 100.0) if last_close > 0 else None
+            out["atr_14"] = round(atr, 2)
+            out["last_close"] = round(last_close, 2)
+            out["atr_pct_of_price"] = (
+                round(atr_pct, 3) if atr_pct is not None else None
+            )
+            # Index intra-day ATR% is typically 0.05% – 0.5%. Anything > 2% on a 5M frame
+            # is almost always bad data.
+            if atr_pct is not None and atr_pct > 2.0:
+                out["warnings"].append(f"atr_pct_high={atr_pct:.2f}%")
+            if atr_pct is not None and atr_pct < 0.005:
+                out["warnings"].append(f"atr_pct_near_zero={atr_pct:.4f}%")
+    except Exception:
+        pass
+
+    # 4) Stale-data sniff — last bar should be within ~30 minutes during market hours.
+    try:
+        if isinstance(df.index, pd.DatetimeIndex) and len(df) >= 1:
+            last_ts = df.index[-1]
+            try:
+                last_naive = pd.Timestamp(last_ts).tz_localize(None)
+            except Exception:
+                last_naive = pd.Timestamp(last_ts)
+            now_naive = pd.Timestamp.utcnow().tz_localize(None)
+            age_min = max(
+                0.0, (now_naive - last_naive).total_seconds() / 60.0
+            )
+            out["last_bar_age_minutes"] = round(age_min, 1)
+            if age_min > 90:
+                out["warnings"].append(
+                    f"stale_last_bar_minutes={age_min:.0f}"
+                )
+    except Exception:
+        pass
+
+    # 5) Recent vs early window price level — if the index switched to a different
+    # instrument the close price will jump by orders of magnitude.
+    try:
+        if "close" in df.columns and len(df) >= 30:
+            head_med = float(df["close"].head(10).median())
+            tail_med = float(df["close"].tail(10).median())
+            if head_med > 0:
+                drift_pct = abs(tail_med - head_med) / head_med * 100.0
+                out["window_drift_pct"] = round(drift_pct, 2)
+                if drift_pct > 25.0:
+                    out["warnings"].append(
+                        f"large_window_drift_pct={drift_pct:.1f}%"
+                    )
+    except Exception:
+        pass
+
+    return out
+
+
 def _ohlcv_tail_records(ohlcv: pd.DataFrame, max_rows: int = 120) -> list[dict[str, Any]]:
     tail = ohlcv.tail(max_rows)
     rows: list[dict[str, Any]] = []
@@ -975,13 +1116,51 @@ def _build_snapshot_context(
     }
 
 
+_TREND_CONTEXT_GUIDANCE = (
+    "TREND CONTEXT (deterministic, multi-timeframe):\n"
+    "The user payload contains a trend_context object computed directly from OHLCV with keys "
+    "regime (combined), primary_regime (5-min), higher_regime (15-min), agreement (bool), "
+    "primary_score, higher_score (each in roughly −5..+5), and reasons describing why each "
+    "timeframe is labelled UPTREND / DOWNTREND / SIDEWAYS / UNKNOWN. Treat this as a hard "
+    "prior: if higher_regime is DOWNTREND, do not output BUY unless you have very strong "
+    "reversal confirmation (bullish engulfing on heavy volume + RSI cross up from oversold + "
+    "reclaim of VWAP). The same applies in reverse for SELL in an UPTREND. A post-AI guardrail "
+    "in the service will downgrade BUY-in-DOWNTREND or SELL-in-UPTREND to HOLD unless "
+    "deterministic reversal evidence (engulfing/hammer + volume spike + RSI zone turn + VWAP "
+    "reclaim) is present, so do not emit speculative counter-trend calls.\n\n"
+    "VOLUME CONFIRMATION:\n"
+    "A separate post-AI gate may force HOLD when last-bar volume vs the 20-bar average is "
+    "below the configured ratio (default disabled). When you see volume_ratio < 0.7 in the "
+    "indicators payload, treat the move as low-conviction and lean toward HOLD or, at minimum, "
+    "reduce confidence by 10 points so the existing floor catches it."
+)
+
+
+def _maybe_append_legacy_guidance(template: str, is_custom: bool) -> str:
+    """
+    Detects legacy custom admin prompts that pre-date the multi-timeframe trend guardrail and
+    volume-confirmation gate, and appends the missing instructions so the AI is always aware of
+    them. The default ``_SYSTEM_PROMPT_TEMPLATE`` already contains these blocks; we only patch
+    user-saved custom templates.
+    """
+    if not is_custom:
+        return template
+    has_trend = "TREND CONTEXT" in template or "trend_context" in template
+    has_volume = "VOLUME CONFIRMATION" in template or "volume_ratio" in template
+    if has_trend and has_volume:
+        return template
+    return f"{template}\n\n{_TREND_CONTEXT_GUIDANCE}"
+
+
 def _build_system_prompt(
     target_minutes: int,
     checklist_weight: int = 40,
     snapshot_ctx: dict[str, Any] | None = None,
 ) -> str:
     remaining = 100 - checklist_weight
-    template = _PromptStore.get() or _SYSTEM_PROMPT_TEMPLATE
+    custom = _PromptStore.get()
+    template = custom or _SYSTEM_PROMPT_TEMPLATE
+    template = _maybe_append_legacy_guidance(template, is_custom=bool(custom))
 
     fmt = _SafeDict(snapshot_ctx or {})
     # Ensure the three base keys are always present even for custom prompts that lack a snapshot
@@ -1435,6 +1614,21 @@ class GeminiPredictor:
         if vix is None or vix.empty:
             logger.info("{} VIX missing — deriving proxy from OHLCV", log_pfx)
             vix = derive_vix_from_ohlcv(ohlcv)
+
+        # Data-quality diagnostic: inspect bar interval consistency, high/low sanity, ATR%.
+        # Surfaces the root cause when ATR seems anomalous (mixed timeframes, bad highs/lows,
+        # stale data, broker glitches, etc.). Logged once per prediction and grep-able as
+        # PRED_DATA_QUALITY pid=...
+        try:
+            dq = _ohlcv_quality_diagnostic(ohlcv, horizon)
+            _log_marker("PRED_DATA_QUALITY", pid, dq)
+            if dq.get("warnings"):
+                logger.warning(
+                    "{} OHLCV data quality warnings: {}",
+                    log_pfx, "; ".join(dq["warnings"]),
+                )
+        except Exception as dq_err:
+            logger.debug("{} data-quality diagnostic failed: {}", log_pfx, dq_err)
 
         target_minutes = _horizon_to_minutes(horizon)
         realtime = _resolve_realtime(ohlcv, sensex_quote)

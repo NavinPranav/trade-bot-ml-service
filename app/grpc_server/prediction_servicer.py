@@ -40,6 +40,15 @@ def _try_import_backtest():
         return None
 
 
+def _grpc_min_bars_for_horizon(horizon):
+    """Resolves the per-horizon minimum-bars floor (with global fallback)."""
+    if horizon and isinstance(settings.min_ohlcv_bars_by_horizon, dict):
+        v = settings.min_ohlcv_bars_by_horizon.get(horizon.upper())
+        if isinstance(v, int) and v > 0:
+            return v
+    return max(1, settings.min_ohlcv_bars_grpc)
+
+
 class PredictionServicer:
     """Implements the PredictionService gRPC interface."""
 
@@ -107,12 +116,12 @@ class PredictionServicer:
                 )
                 return self._build_response(pb2, buf.get_baseline_horizon(), cached_live)
 
-        min_bars = settings.min_ohlcv_bars_grpc
+        min_bars = _grpc_min_bars_for_horizon(request.horizon)
         if len(request.sensex_ohlcv) < min_bars:
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                f"sensex_ohlcv must contain at least {min_bars} trading days of bars "
-                "(after aggregating intraday data; configure min_ohlcv_bars_grpc if needed)",
+                f"sensex_ohlcv must contain at least {min_bars} bars for horizon={request.horizon} "
+                "(per-horizon floor; configure min_ohlcv_bars_by_horizon if needed)",
             )
         ohlcv = ohlcv_bars_to_dataframe(request.sensex_ohlcv)
         if ohlcv.empty:
@@ -184,11 +193,11 @@ class PredictionServicer:
         if self.predictor is None:
             await context.abort(grpc.StatusCode.UNIMPLEMENTED, _ML_UNAVAILABLE_MSG)
 
-        min_bars = settings.min_ohlcv_bars_grpc
+        min_bars = _grpc_min_bars_for_horizon(request.horizon)
         if len(request.sensex_ohlcv) < min_bars:
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                f"sensex_ohlcv must contain at least {min_bars} trading days of bars",
+                f"sensex_ohlcv must contain at least {min_bars} bars for horizon={request.horizon}",
             )
 
         ohlcv = ohlcv_bars_to_dataframe(request.sensex_ohlcv)

@@ -116,6 +116,18 @@ class AnalyseRequest(BaseModel):
     predictions: List[PredictionRecord]
 
 
+def _min_bars_for_horizon(horizon) -> int:
+    """
+    Resolves the minimum-bars floor for a given horizon. Falls back to
+    ``settings.min_ohlcv_bars_grpc`` when the horizon isn't explicitly mapped.
+    """
+    if horizon and isinstance(settings.min_ohlcv_bars_by_horizon, dict):
+        v = settings.min_ohlcv_bars_by_horizon.get(horizon.upper())
+        if isinstance(v, int) and v > 0:
+            return v
+    return max(1, settings.min_ohlcv_bars_grpc)
+
+
 # ── Health / debug routes ──────────────────────────────────────────────
 
 @app.get("/")
@@ -155,10 +167,30 @@ async def model_status():
 async def get_active_prompt():
     from app.inference.gemini_predictor import _PromptStore, _SYSTEM_PROMPT_TEMPLATE
     custom = _PromptStore.get()
+    is_custom = bool(custom)
+    text = custom if is_custom else _SYSTEM_PROMPT_TEMPLATE
+
+    # Surface missing-feature flags so the admin UI can show a “your prompt is missing X” notice.
+    has_trend_guidance = "TREND CONTEXT" in text or "trend_context" in text
+    has_volume_guidance = "VOLUME CONFIRMATION" in text or "volume_ratio" in text
+    legacy_warnings = []
+    if is_custom and not has_trend_guidance:
+        legacy_warnings.append(
+            "Custom prompt is missing the TREND CONTEXT block — the service auto-appends it at runtime, "
+            "but consider DELETE /admin/prompt to fall back to the up-to-date default template."
+        )
+    if is_custom and not has_volume_guidance:
+        legacy_warnings.append(
+            "Custom prompt is missing the VOLUME CONFIRMATION block — auto-appended at runtime."
+        )
+
     return {
-        "active": bool(custom),
-        "prompt_text": custom if custom else _SYSTEM_PROMPT_TEMPLATE,
-        "is_custom": bool(custom),
+        "active": is_custom,
+        "prompt_text": text,
+        "is_custom": is_custom,
+        "has_trend_guidance": has_trend_guidance,
+        "has_volume_guidance": has_volume_guidance,
+        "legacy_warnings": legacy_warnings,
     }
 
 
@@ -508,13 +540,13 @@ async def predict(req: PredictRequest):
     from app.grpc_server.live_tick_buffer import get_live_tick_buffer
     from app.inference.gemini_predictor import GeminiPredictor
 
-    min_bars = settings.min_ohlcv_bars_grpc
+    min_bars = _min_bars_for_horizon(req.horizon)
     if len(req.sensex_ohlcv) < min_bars:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"sensex_ohlcv must contain at least {min_bars} trading days of bars "
-                "(after aggregating intraday data; configure min_ohlcv_bars_grpc if needed)"
+                f"sensex_ohlcv must contain at least {min_bars} bars for horizon={req.horizon} "
+                "(per-horizon floor; configure min_ohlcv_bars_by_horizon if needed)"
             ),
         )
 

@@ -34,6 +34,15 @@ def live_tick_routing_key(tick) -> str:
     return (sym or tok).upper()
 
 
+def _baseline_min_bars(horizon) -> int:
+    """Per-horizon minimum bars required to establish a *fresh* live baseline."""
+    if horizon and isinstance(getattr(settings, "min_ohlcv_bars_by_horizon", None), dict):
+        v = settings.min_ohlcv_bars_by_horizon.get(horizon.upper())
+        if isinstance(v, int) and v > 0:
+            return v
+    return max(1, settings.min_ohlcv_bars_grpc)
+
+
 @dataclass
 class TickSnapshot:
     symbol: str
@@ -129,8 +138,32 @@ class LiveTickBuffer:
         underlying_symbol: str = "",
         instrument_token: str = "",
     ) -> None:
-        """Called from GetPrediction/GetGeminiPrediction to snapshot historical data for live merging."""
+        """
+        Called from GetPrediction/GetGeminiPrediction to snapshot historical data for live merging.
+
+        Refuses to overwrite a good baseline with a thin / undersized payload — this prevents a
+        small (e.g. 5-bar) one-off request from poisoning the live re-prediction pipeline that the
+        debounced tick stream uses, which would otherwise produce useless ``HOLD`` predictions
+        until the next full-history call lands.
+        """
+        bars = len(ohlcv) if ohlcv is not None else 0
+        min_bars = _baseline_min_bars(horizon)
         with self._lock:
+            existing_bars = len(self._baseline_ohlcv) if self._baseline_ohlcv is not None else 0
+
+            if bars < min_bars:
+                if existing_bars >= min_bars:
+                    logger.warning(
+                        f"Baseline NOT updated (would degrade quality): "
+                        f"new bars={bars} < min={min_bars} for horizon={horizon}; "
+                        f"keeping existing baseline (bars={existing_bars})"
+                    )
+                    return
+                logger.warning(
+                    f"Baseline write below floor: bars={bars} < min={min_bars} for horizon={horizon} "
+                    f"(no better baseline exists; storing anyway, live re-prediction will use it cautiously)"
+                )
+
             self._baseline_ohlcv = ohlcv.copy() if ohlcv is not None else None
             self._baseline_vix = vix.copy() if vix is not None else None
             self._baseline_horizon = horizon
@@ -141,7 +174,7 @@ class LiveTickBuffer:
             logger.info(
                 f"Baseline stored: engine={engine} horizon={horizon} "
                 f"underlying={self._baseline_underlying!r} token={self._baseline_instrument_token!r} "
-                f"bars={len(ohlcv) if ohlcv is not None else 0} "
+                f"bars={bars} "
                 f"vix={'yes' if vix is not None and not vix.empty else 'no'}"
             )
 
