@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
@@ -17,6 +18,44 @@ import httpx
 import numpy as np
 import pandas as pd
 from loguru import logger
+
+
+# ── Logging helpers ────────────────────────────────────────────────────────
+#
+# Every prediction generates a short hex correlation ID (`pid`) which is
+# emitted on every per-stage line plus the final structured PRED_RESULT line.
+# In prod you can:
+#   - grep PRED_RESULT  → one JSON line per prediction (parseable with jq)
+#   - grep "pid=abc12345" → all lines for a single prediction
+# All structured marker lines are at INFO so the default LOG_LEVEL=INFO surfaces
+# them; per-stage detail lines are at INFO too because predictions run only
+# every few minutes (≈ 60–360 lines/day total).
+
+
+def _make_pid() -> str:
+    """Short opaque correlation id for one prediction call."""
+    return uuid.uuid4().hex[:8]
+
+
+def _safe_round(v: Any, n: int = 2) -> Any:
+    """Round numeric values for log payloads; pass through None/N/A unchanged."""
+    if v is None:
+        return None
+    try:
+        return round(float(v), n)
+    except (TypeError, ValueError):
+        return v
+
+
+def _log_marker(marker: str, pid: str, payload: Optional[dict[str, Any]] = None) -> None:
+    """Emit ``MARKER pid=xxxxxxxx {…json…}`` so prod logs are easy to grep + jq."""
+    payload = payload or {}
+    body = {"pid": pid, **payload}
+    try:
+        text = json.dumps(body, default=str, separators=(",", ":"))
+    except Exception:
+        text = str(body)
+    logger.info("{} {}", marker, text)
 
 from app.config import settings
 from app.data.ingestion.news_fetcher import get_news_sentiment
@@ -1088,6 +1127,7 @@ def _coerce_result(
     checklist_signal: Optional[dict[str, Any]] = None,
     trend_context: Optional[dict[str, Any]] = None,
     ohlcv: Optional[pd.DataFrame] = None,
+    pid: Optional[str] = None,
 ) -> Dict[str, Any]:
     # Model output before policy (confidence / R:R). Used so entry/SL/target in history
     # still reflect what Gemini predicted even when we downgrade the tradable signal to HOLD.
@@ -1095,6 +1135,17 @@ def _coerce_result(
     direction = model_direction
     trend_guardrail_reason: Optional[str] = None
     volume_gate_reason: Optional[str] = None
+    pid = pid or _make_pid()
+    log_pfx = f"[pid={pid}]"
+    # Track which gates fired so we can emit a single-line PRED_GATES summary.
+    gates: dict[str, Any] = {
+        "dead_market": False,
+        "low_confidence": False,
+        "low_rr": False,
+        "volume_gate": False,
+        "trend_guardrail": False,
+        "reversal_override": False,
+    }
 
     def _f(key: str, default: float = 0.0) -> float:
         try:
@@ -1111,9 +1162,11 @@ def _coerce_result(
 
     if _dead_market_from_indicators(indicators, realtime_price) and model_direction in ("BUY", "SELL"):
         logger.info(
-            "ATR%% vs price below min_atr_pct_of_price — overriding {} → HOLD (low volatility gate)",
+            "{} ATR%% vs price below min_atr_pct_of_price — overriding {} → HOLD (low volatility gate)",
+            log_pfx,
             model_direction,
         )
+        gates["dead_market"] = True
         direction = "HOLD"
 
     eff_floor = _effective_confidence_floor(
@@ -1121,11 +1174,13 @@ def _coerce_result(
     )
     if confidence < eff_floor and model_direction != "HOLD":
         logger.info(
-            "Confidence {:.1f}% < {:.1f} — overriding {} → HOLD (no-trade zone)",
+            "{} Confidence {:.1f}% < {:.1f} — overriding {} → HOLD (no-trade zone)",
+            log_pfx,
             confidence,
             eff_floor,
             model_direction,
         )
+        gates["low_confidence"] = True
         direction = "HOLD"
 
     # Trading levels (always derive fallbacks from model_direction so below-threshold rows keep levels)
@@ -1156,11 +1211,13 @@ def _coerce_result(
     # Enforce minimum R:R for non-HOLD signals
     if direction != "HOLD" and risk_reward < min_rr:
         logger.info(
-            "R:R {:.2f} < {:.2f} — overriding {} → HOLD",
+            "{} R:R {:.2f} < {:.2f} — overriding {} → HOLD",
+            log_pfx,
             risk_reward,
             min_rr,
             direction,
         )
+        gates["low_rr"] = True
         direction = "HOLD"
 
     # Volume confirmation gate: reject BUY/SELL when last-bar volume vs 20-bar avg is
@@ -1179,11 +1236,13 @@ def _coerce_result(
                 vr = None
             if vr is not None and vr < min_vol_ratio:
                 logger.info(
-                    "Volume confirmation failed — {:.2f}x < {:.2f}x — overriding {} → HOLD",
+                    "{} Volume confirmation failed — {:.2f}x < {:.2f}x — overriding {} → HOLD",
+                    log_pfx,
                     vr,
                     min_vol_ratio,
                     direction,
                 )
+                gates["volume_gate"] = True
                 volume_gate_reason = (
                     f"{direction} blocked by volume confirmation gate — "
                     f"{vr:.2f}x average < {min_vol_ratio:.2f}x required"
@@ -1213,17 +1272,22 @@ def _coerce_result(
         new_direction, reason = _apply_trend_guardrail(direction, trend_context, reversal_info)
         if new_direction != direction:
             logger.info(
-                "Trend guardrail tripped — overriding {} → {} ({})",
+                "{} Trend guardrail tripped — overriding {} → {} ({})",
+                log_pfx,
                 direction,
                 new_direction,
                 reason,
             )
+            gates["trend_guardrail"] = True
             direction = new_direction
             trend_guardrail_reason = reason
         elif reason and reversal_info and reversal_info.get("confirmed"):
             # Same direction but the guardrail had an opposing regime; reversal override
             # let it through. Surface this in prediction_reason for transparency.
-            logger.info("Trend guardrail bypassed by reversal confirmation: {}", reason)
+            logger.info(
+                "{} Trend guardrail bypassed by reversal confirmation: {}", log_pfx, reason
+            )
+            gates["reversal_override"] = True
             trend_guardrail_reason = reason
 
     # Testing / QA: always expose numeric SL and TP for HOLD (incl. low-confidence / no-trade),
@@ -1281,6 +1345,29 @@ def _coerce_result(
     notice = raw.get("ai_quota_notice")
     if notice:
         out["ai_quota_notice"] = str(notice).strip()[:4000]
+
+    # Per-gate decision summary for monitoring. Stash diagnostics on a private
+    # key so the predict() caller can include them in the final PRED_RESULT
+    # JSON line. The key starts with `_` so the gRPC response builder ignores it.
+    gates_summary = {
+        "model_direction": model_direction,
+        "final_direction": direction,
+        "raw_confidence": round(confidence, 2),
+        "effective_confidence_floor": round(eff_floor, 2),
+        "raw_risk_reward": round(risk_reward, 2) if risk_reward else None,
+        "min_risk_reward": round(min_rr, 2),
+        "gates": gates,
+        "reversal": {
+            "score": (reversal_info or {}).get("score"),
+            "required": (reversal_info or {}).get("required_signals"),
+            "confirmed": (reversal_info or {}).get("confirmed"),
+            "reasons": (reversal_info or {}).get("reasons") or [],
+        } if reversal_info is not None else None,
+        "guardrail_reason": trend_guardrail_reason,
+        "volume_gate_reason": volume_gate_reason,
+    }
+    out["_diagnostics"] = gates_summary
+    _log_marker("PRED_GATES", pid, gates_summary)
     return out
 
 
@@ -1306,13 +1393,29 @@ class GeminiPredictor:
         sensex_quote: Optional[Dict[str, Any]] = None,
         underlying_symbol: str = "",
     ) -> Dict[str, Any]:
+        pid = _make_pid()
+        log_pfx = f"[pid={pid}]"
+        sym = (underlying_symbol or "BANKNIFTY").strip() or "BANKNIFTY"
+        bars_count = 0 if ohlcv is None else int(len(ohlcv))
+        vix_count = 0 if vix is None else int(len(vix))
+
+        _log_marker("PRED_START", pid, {
+            "horizon": horizon,
+            "symbol": sym,
+            "ohlcv_bars": bars_count,
+            "vix_bars": vix_count,
+            "has_quote": bool(sensex_quote and sensex_quote.get("price")),
+            "quote_price": _safe_round((sensex_quote or {}).get("price")),
+        })
+
         key = (settings.gemini_api_key or "").strip()
         if not key:
+            logger.error("{} GEMINI_API_KEY is not set — predict aborted", log_pfx)
             raise RuntimeError("GEMINI_API_KEY is not set")
 
         if ohlcv is None or ohlcv.empty:
-            logger.error("GeminiPredictor: empty OHLCV")
-            return {
+            logger.error("{} empty OHLCV — returning HOLD placeholder", log_pfx)
+            placeholder = {
                 "error": "No market data available",
                 "direction": "HOLD",
                 "magnitude": 0, "confidence": 0,
@@ -1321,8 +1424,16 @@ class GeminiPredictor:
                 "risk_reward": 0, "valid_minutes": 15,
                 "prediction_reason": "No OHLCV bars available — cannot assess trend.",
             }
+            _log_marker("PRED_RESULT", pid, {
+                "horizon": horizon,
+                "symbol": sym,
+                "final_direction": "HOLD",
+                "abort_reason": "empty_ohlcv",
+            })
+            return placeholder
 
         if vix is None or vix.empty:
+            logger.info("{} VIX missing — deriving proxy from OHLCV", log_pfx)
             vix = derive_vix_from_ohlcv(ohlcv)
 
         target_minutes = _horizon_to_minutes(horizon)
@@ -1330,13 +1441,29 @@ class GeminiPredictor:
 
         # Compute technical indicators for the current bar
         indicators = _compute_indicator_snapshot(ohlcv)
+        _log_marker("PRED_INDICATORS", pid, {
+            "rsi_14": indicators.get("rsi_14"),
+            "ema_9": indicators.get("ema_9"),
+            "ema_21": indicators.get("ema_21"),
+            "ema_50": indicators.get("ema_50"),
+            "ema9_above_ema21": indicators.get("ema9_above_ema21"),
+            "atr_14": indicators.get("atr_14"),
+            "macd": indicators.get("macd"),
+            "macd_signal": indicators.get("macd_signal"),
+            "macd_hist": indicators.get("macd_hist"),
+            "bb_pct": indicators.get("bb_pct"),
+            "bb_width": indicators.get("bb_width"),
+            "volume_ratio": indicators.get("volume_ratio"),
+            "price": _safe_round(realtime.get("price")),
+            "change_pct_today": _safe_round(realtime.get("change_pct"), 3),
+        })
 
         # Deterministic multi-timeframe trend regime (used by both the prompt
         # and the post-AI guardrail to suppress counter-trend BUY/SELL).
         try:
             trend_context = _detect_trend_context(ohlcv)
         except Exception as e:
-            logger.warning("Trend context computation failed: {}", e)
+            logger.warning("{} Trend context computation failed: {}", log_pfx, e)
             trend_context = {
                 "regime": "UNKNOWN",
                 "primary_regime": "UNKNOWN",
@@ -1348,19 +1475,42 @@ class GeminiPredictor:
                 "higher_reasons": [],
                 "evidence": {"primary": {}, "higher": {}, "error": str(e)},
             }
+        _log_marker("PRED_TREND", pid, {
+            "regime": trend_context.get("regime"),
+            "primary_regime": trend_context.get("primary_regime"),
+            "higher_regime": trend_context.get("higher_regime"),
+            "agreement": trend_context.get("agreement"),
+            "primary_score": trend_context.get("primary_score"),
+            "higher_score": trend_context.get("higher_score"),
+            "primary_reasons": trend_context.get("primary_reasons"),
+            "higher_reasons": trend_context.get("higher_reasons"),
+        })
 
         checklist_weight = _ChecklistWeightStore.get()
         try:
             checklist_signal = run_checklist(ohlcv)
         except Exception as e:
-            logger.warning("Checklist computation failed: {}", e)
+            logger.warning("{} Checklist computation failed: {}", log_pfx, e)
             checklist_signal = {"overall": "NO_DATA", "error": str(e)}
+        _log_marker("PRED_CHECKLIST", pid, {
+            "overall": checklist_signal.get("overall"),
+            "weight_pct": checklist_weight,
+            "step5_signal": (checklist_signal.get("step5_levels") or {}).get("signal"),
+        })
 
         try:
             news_sentiment = get_news_sentiment()
         except Exception as e:
-            logger.warning("News sentiment fetch failed: {}", e)
+            logger.warning("{} News sentiment fetch failed: {}", log_pfx, e)
             news_sentiment = {"overall": "UNAVAILABLE", "error": str(e)}
+        _log_marker("PRED_NEWS", pid, {
+            "overall": news_sentiment.get("overall"),
+            "score": news_sentiment.get("score"),
+            "bullish_count": news_sentiment.get("bullish_count"),
+            "bearish_count": news_sentiment.get("bearish_count"),
+            "neutral_count": news_sentiment.get("neutral_count"),
+            "fetched_at_ist": news_sentiment.get("fetched_at_ist"),
+        })
 
         snapshot_ctx = _build_snapshot_context(
             ohlcv, vix, indicators, checklist_signal, realtime, target_minutes
@@ -1397,6 +1547,13 @@ class GeminiPredictor:
         }
         headers = {"Content-Type": "application/json"}
 
+        _log_marker("PRED_GEMINI_REQUEST", pid, {
+            "model": model,
+            "user_payload_chars": len(user_text),
+            "system_prompt_chars": len(system_prompt),
+            "target_minutes": target_minutes,
+        })
+
         def _post_once(client: httpx.Client) -> httpx.Response:
             r = client.post(url, headers=headers, json=body)
             if r.status_code == 400:
@@ -1408,14 +1565,18 @@ class GeminiPredictor:
                 r = client.post(url, headers=headers, json=body_plain)
             return r
 
+        gemini_t0 = time.monotonic()
+        gemini_attempts = 0
         with httpx.Client(timeout=120.0) as client:
             resp: Optional[httpx.Response] = None
             for attempt in range(_GEMINI_MAX_LOAD_RETRIES):
+                gemini_attempts += 1
                 resp = _post_once(client)
                 if resp.status_code in _GEMINI_RETRYABLE_HTTP and attempt < _GEMINI_MAX_LOAD_RETRIES - 1:
                     wait_s = min(8.0, 0.75 * (2 ** attempt))
                     logger.warning(
-                        "Gemini {} (transient) attempt {}/{} retry in {:.1f}s",
+                        "{} Gemini {} (transient) attempt {}/{} retry in {:.1f}s",
+                        log_pfx,
                         resp.status_code, attempt + 1, _GEMINI_MAX_LOAD_RETRIES, wait_s,
                     )
                     time.sleep(wait_s)
@@ -1431,19 +1592,30 @@ class GeminiPredictor:
                 for attempt in range(max_r - 1):
                     wait_s = min(90.0, base_d * (2 ** attempt))
                     logger.warning(
-                        "Gemini 429 rate limit — retry {}/{} in {:.1f}s",
+                        "{} Gemini 429 rate limit — retry {}/{} in {:.1f}s",
+                        log_pfx,
                         attempt + 1,
                         max_r - 1,
                         wait_s,
                     )
                     time.sleep(wait_s)
+                    gemini_attempts += 1
                     resp = _post_once(client)
                     if resp.status_code != 429:
                         break
 
+            gemini_latency_ms = int((time.monotonic() - gemini_t0) * 1000)
+
             if resp.status_code == 429:
-                logger.warning("Gemini 429 exhausted retries — HOLD fallback")
-                return _coerce_result(
+                logger.warning(
+                    "{} Gemini 429 exhausted retries after {} attempts ({}ms) — HOLD fallback",
+                    log_pfx, gemini_attempts, gemini_latency_ms,
+                )
+                _log_marker("PRED_GEMINI_RESPONSE", pid, {
+                    "status": 429, "attempts": gemini_attempts,
+                    "latency_ms": gemini_latency_ms, "outcome": "rate_limit_fallback",
+                })
+                fb = _coerce_result(
                     {
                         "direction": "HOLD", "magnitude": 0.0, "confidence": 0.0,
                         "predicted_volatility": 0.0, "valid_minutes": target_minutes,
@@ -1454,11 +1626,23 @@ class GeminiPredictor:
                     indicators=indicators,
                     trend_context=trend_context,
                     ohlcv=ohlcv,
+                    pid=pid,
                 )
+                self._log_pred_result(pid, horizon, sym, target_minutes, fb,
+                                      gemini_latency_ms, gemini_attempts, status=429,
+                                      fallback="rate_limit")
+                return fb
 
             if resp.status_code in _GEMINI_RETRYABLE_HTTP:
-                logger.warning("Gemini still {} after retries — HOLD fallback", resp.status_code)
-                return _coerce_result(
+                logger.warning(
+                    "{} Gemini still {} after {} attempts ({}ms) — HOLD fallback",
+                    log_pfx, resp.status_code, gemini_attempts, gemini_latency_ms,
+                )
+                _log_marker("PRED_GEMINI_RESPONSE", pid, {
+                    "status": resp.status_code, "attempts": gemini_attempts,
+                    "latency_ms": gemini_latency_ms, "outcome": "capacity_fallback",
+                })
+                fb = _coerce_result(
                     {
                         "direction": "HOLD", "magnitude": 0.0, "confidence": 0.0,
                         "predicted_volatility": 0.0, "valid_minutes": target_minutes,
@@ -1469,11 +1653,24 @@ class GeminiPredictor:
                     indicators=indicators,
                     trend_context=trend_context,
                     ohlcv=ohlcv,
+                    pid=pid,
                 )
+                self._log_pred_result(pid, horizon, sym, target_minutes, fb,
+                                      gemini_latency_ms, gemini_attempts, status=resp.status_code,
+                                      fallback="capacity")
+                return fb
 
             if resp.status_code >= 400:
                 detail = (resp.text or "")[:2048]
-                logger.error("Gemini HTTP {} model={!r}: {}", resp.status_code, model, detail)
+                logger.error(
+                    "{} Gemini HTTP {} model={!r} latency={}ms attempts={}: {}",
+                    log_pfx, resp.status_code, model, gemini_latency_ms, gemini_attempts, detail,
+                )
+                _log_marker("PRED_GEMINI_RESPONSE", pid, {
+                    "status": resp.status_code, "attempts": gemini_attempts,
+                    "latency_ms": gemini_latency_ms, "outcome": "error",
+                    "error_detail": detail[:512],
+                })
                 raise RuntimeError(f"Gemini HTTP {resp.status_code}: {detail}")
 
             data = resp.json()
@@ -1485,6 +1682,21 @@ class GeminiPredictor:
         if not raw.get("valid_minutes"):
             raw["valid_minutes"] = target_minutes
 
+        _log_marker("PRED_GEMINI_RESPONSE", pid, {
+            "status": resp.status_code,
+            "attempts": gemini_attempts,
+            "latency_ms": gemini_latency_ms,
+            "outcome": "ok",
+            "raw_direction": _normalize_direction(raw),
+            "raw_confidence": _safe_round(raw.get("confidence")),
+            "raw_magnitude": _safe_round(raw.get("magnitude"), 4),
+            "raw_risk_reward": _safe_round(raw.get("risk_reward")),
+            "raw_valid_minutes": raw.get("valid_minutes"),
+            "raw_entry_price": _safe_round(raw.get("entry_price")),
+            "raw_stop_loss": _safe_round(raw.get("stop_loss")),
+            "raw_target_price": _safe_round(raw.get("target_price")),
+        })
+
         result = _coerce_result(
             raw,
             float(realtime["price"]),
@@ -1492,16 +1704,109 @@ class GeminiPredictor:
             checklist_signal=checklist_signal,
             trend_context=trend_context,
             ohlcv=ohlcv,
+            pid=pid,
         )
 
+        self._log_pred_result(pid, horizon, sym, target_minutes, result,
+                              gemini_latency_ms, gemini_attempts, status=resp.status_code,
+                              fallback=None, trend_context=trend_context,
+                              news_sentiment=news_sentiment, checklist_signal=checklist_signal,
+                              indicators=indicators)
+        return result
+
+    @staticmethod
+    def _log_pred_result(
+        pid: str,
+        horizon: str,
+        symbol: str,
+        target_minutes: int,
+        result: Dict[str, Any],
+        gemini_latency_ms: int,
+        gemini_attempts: int,
+        *,
+        status: Optional[int] = None,
+        fallback: Optional[str] = None,
+        trend_context: Optional[dict[str, Any]] = None,
+        news_sentiment: Optional[dict[str, Any]] = None,
+        checklist_signal: Optional[dict[str, Any]] = None,
+        indicators: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Emit the canonical end-of-prediction structured log line.
+
+        ``PRED_RESULT pid=… {json}`` is the single line per-prediction blackbox.
+        Every field needed to debug or aggregate prediction quality is here.
+        Filter live with ``grep PRED_RESULT | jq .``.
+        """
+        diag = result.get("_diagnostics") or {}
+        payload = {
+            "horizon": horizon,
+            "symbol": symbol,
+            "target_minutes": target_minutes,
+            "model_direction": diag.get("model_direction"),
+            "final_direction": result.get("direction"),
+            "confidence": result.get("confidence"),
+            "effective_floor": diag.get("effective_confidence_floor"),
+            "magnitude": result.get("magnitude"),
+            "risk_reward": result.get("risk_reward"),
+            "min_risk_reward": diag.get("min_risk_reward"),
+            "valid_minutes": result.get("valid_minutes"),
+            "entry_price": result.get("entry_price"),
+            "stop_loss": result.get("stop_loss"),
+            "target_price": result.get("target_price"),
+            "current_sensex": result.get("current_sensex"),
+            "target_sensex": result.get("target_sensex"),
+            "predicted_volatility": result.get("predicted_volatility"),
+            "gates": diag.get("gates"),
+            "reversal": diag.get("reversal"),
+            "guardrail_reason": diag.get("guardrail_reason"),
+            "volume_gate_reason": diag.get("volume_gate_reason"),
+            "trend": (
+                {
+                    "regime": (trend_context or {}).get("regime"),
+                    "primary_regime": (trend_context or {}).get("primary_regime"),
+                    "higher_regime": (trend_context or {}).get("higher_regime"),
+                    "agreement": (trend_context or {}).get("agreement"),
+                    "primary_score": (trend_context or {}).get("primary_score"),
+                    "higher_score": (trend_context or {}).get("higher_score"),
+                }
+                if trend_context else None
+            ),
+            "checklist_overall": (checklist_signal or {}).get("overall") if checklist_signal else None,
+            "news_overall": (news_sentiment or {}).get("overall") if news_sentiment else None,
+            "news_score": (news_sentiment or {}).get("score") if news_sentiment else None,
+            "indicators_summary": (
+                {
+                    "rsi_14": indicators.get("rsi_14"),
+                    "atr_14": indicators.get("atr_14"),
+                    "volume_ratio": indicators.get("volume_ratio"),
+                    "ema9_above_ema21": indicators.get("ema9_above_ema21"),
+                }
+                if indicators else None
+            ),
+            "gemini": {
+                "status": status,
+                "latency_ms": gemini_latency_ms,
+                "attempts": gemini_attempts,
+                "fallback": fallback,
+            },
+            "ai_quota_notice": result.get("ai_quota_notice"),
+        }
+        _log_marker("PRED_RESULT", pid, payload)
+        # Keep the human-friendly compact summary too — easy to read in tail logs.
         logger.info(
-            "Gemini intraday [{}min] {} | conf={:.0f}% | entry={} SL={} TP={} RR={}",
+            "[pid={}] DONE [{}min] model={}→final={} | conf={:.0f}% (floor={}) | "
+            "entry={} SL={} TP={} RR={} | gemini={}ms/{}attempts | regime={}",
+            pid,
             target_minutes,
-            result["direction"],
-            result["confidence"],
+            diag.get("model_direction") or "?",
+            result.get("direction") or "?",
+            float(result.get("confidence") or 0.0),
+            diag.get("effective_confidence_floor"),
             result.get("entry_price"),
             result.get("stop_loss"),
             result.get("target_price"),
             result.get("risk_reward"),
+            gemini_latency_ms,
+            gemini_attempts,
+            (trend_context or {}).get("regime") if trend_context else "n/a",
         )
-        return result
