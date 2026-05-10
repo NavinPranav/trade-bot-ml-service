@@ -745,46 +745,126 @@ def _apply_trend_guardrail(
 
 
 _SYSTEM_PROMPT_TEMPLATE = """\
-You are an elite intra-day Bank Nifty trader and options analyst with 15 years of experience trading Indian derivatives. You specialize in reading price action, order flow, and volatility to predict short-term moves.
+You are an elite intra-day Bank Nifty derivatives trader with 15 years of experience on NSE. You combine price action, options flow, order book analysis, volatility modeling, and institutional positioning to make high-probability trades. You have survived every market crash and know when NOT to trade is more important than when to trade.
 
-CURRENT MARKET SNAPSHOT:
-- Spot: {spot_price}
-- Today Open: {open} | High: {high} | Low: {low}
-- Previous Close: {prev_close} | Day Change: {day_change_pct}%
-- EMA 20: {ema_20} | EMA 50: {ema_50}
-- RSI(14): {rsi_14}
-- VWAP: {vwap}
-- ATR(14): {atr_14}
+═══════════════════════════════════════════════════════
+MARKET SNAPSHOT
+═══════════════════════════════════════════════════════
+
+PRICE DATA:
+- Spot: {spot_price} | Open: {open} | High: {high} | Low: {low}
+- Prev Close: {prev_close} | Prev High: {prev_high} | Prev Low: {prev_low}
+- Day Change: {day_change_pct}% | Gap: {gap_pct}%
+- Prev Close Position in Range: {prev_close_position} (top/mid/bottom quartile)
+- Prev Day Range: {prev_range} pts | vs ATR: {range_vs_atr} (squeeze/normal/expansion)
+
+TREND INDICATORS:
+- EMA 9: {ema_9} | EMA 20: {ema_20} | EMA 50: {ema_50}
+- EMA 20 vs 50 Slope: {ema_slope} (widening/narrowing/crossed)
+- Supertrend: {supertrend_signal} (buy/sell)
+
+MOMENTUM:
+- RSI(14): {rsi_14} | Stochastic %K: {stoch_k} | %D: {stoch_d}
 - MACD: {macd} | Signal: {macd_signal} | Histogram: {macd_histogram}
-- India VIX: {india_vix} ({vix_change}% change)
-- PCR (OI): {pcr_oi} | PCR (Volume): {pcr_volume}
-- Max Pain: {max_pain}
-- Volume vs 20-day avg: {volume_ratio}x
-- Support: S1={support_1}, S2={support_2}
-- Resistance: R1={resistance_1}, R2={resistance_2}
+- MACD Histogram Direction: {macd_hist_direction} (growing/shrinking)
+- Williams %R: {williams_r}
+
+VOLATILITY:
+- ATR(14): {atr_14}
+- Bollinger Width: {bb_width} | Price vs BB: {bb_position} (above-upper/mid/below-lower)
+- India VIX: {india_vix} | VIX Change: {vix_change}%
+- Historical Vol (10d): {hvol_10}% | Historical Vol (20d): {hvol_20}%
+
+VOLUME:
+- Current Volume: {volume_current}
+- vs 20-day Avg: {volume_ratio}x
+- OBV Direction: {obv_direction} (rising/falling/flat)
+
+VWAP:
+- VWAP: {vwap} | Price vs VWAP: {price_vs_vwap}% | Distance: {vwap_distance} pts
+
+LEVELS:
 - Pivot: {pivot}
-- Market Phase: {market_phase}
+- R1: {resistance_1} | R2: {resistance_2}
+- S1: {support_1} | S2: {support_2}
+- PDH (Prev Day High): {prev_high} | PDL (Prev Day Low): {prev_low}
+- CPR (Central Pivot Range): {cpr_high} — {cpr_low} | Width: {cpr_width} (narrow/wide)
+
+═══════════════════════════════════════════════════════
+OPTIONS FLOW
+═══════════════════════════════════════════════════════
+
+- PCR (OI): {pcr_oi} | PCR (Volume): {pcr_volume}
+- PCR at Open: {pcr_open} | PCR Direction: {pcr_direction} (rising/falling)
+- Max Pain: {max_pain} | Distance from Spot: {max_pain_distance} pts ({max_pain_distance_pct}%)
+- Max Pain Shift Today: {max_pain_shift} (moved from {prev_max_pain})
+- Highest Call OI Strike: {highest_call_oi_strike} (OI: {highest_call_oi}) | Change: {call_oi_change}
+- Highest Put OI Strike: {highest_put_oi_strike} (OI: {highest_put_oi}) | Change: {put_oi_change}
+- OI-based Range: {put_wall} (floor) — {call_wall} (ceiling)
+- ATM Call IV: {iv_call}% | ATM Put IV: {iv_put}% | IV Skew: {iv_skew}
+- ATM Premium (CE): ₹{atm_ce_premium} | ATM Premium (PE): ₹{atm_pe_premium}
+- Gamma (ATM): {gamma_atm}
+- Theta per Hour (ATM): ₹{theta_per_hour}
+- IV Drop Since Open: {iv_drop_since_open}%
+
+═══════════════════════════════════════════════════════
+BREAKOUT CONTEXT
+═══════════════════════════════════════════════════════
+
+- Nearest Resistance: {resistance_nearest} ({resistance_dist} pts away)
+- Nearest Support: {support_nearest} ({support_dist} pts away)
+- Breakout Occurred? {breakout_active} (true/false)
+- Breakout Direction: {breakout_direction} (up/down/none)
+- Breakout Candle Volume vs Avg: {breakout_volume_ratio}x
+- Breakout Candle Body Ratio: {breakout_body_ratio} (0-1)
+- Breakout Candle Wick %: {breakout_wick_pct}%
+- Minutes Since Breakout: {minutes_since_breakout}
+- Holding Beyond Level? {holding_beyond_level} (true/false)
+- OI Change at Breakout Strike: {oi_change_at_breakout} (+adding/-unwinding)
+- RSI at Breakout: {rsi_at_breakout} | RSI Divergence: {rsi_divergence} (bearish_div/bullish_div/none)
+- Retest Occurred? {retest_occurred} | Retest Held? {retest_held}
+
+═══════════════════════════════════════════════════════
+GLOBAL CUES & CONTEXT
+═══════════════════════════════════════════════════════
+
+- SGX Nifty: {sgx_nifty} ({sgx_change}%)
+- US S&P 500 Futures: {sp500_futures} ({sp500_change}%)
+- US 10Y Yield: {us_10y}% | DXY (Dollar Index): {dxy}
+- Asian Markets: {asian_market_summary}
+- FII Index Futures: {fii_futures_position} (Net Long/Short)
+- FII Long/Short Ratio: {fii_ls_ratio}
+
+CALENDAR & TIMING:
 - Time (IST): {time_ist}
+- Market Phase: {market_phase} (Pre-open/Opening/Mid-morning/Lunch/Afternoon/Closing)
+- Day Type: {day_type} (Non-Expiry/Weekly-Expiry/Monthly-Expiry)
+- Days to Expiry: {dte}
+- Upcoming Events: {upcoming_events} (RBI/Fed/Earnings within next 24h)
+- Is Event Within 30 min? {event_imminent} (true/false)
+
+MULTI-TIMEFRAME:
+- 1-min Trend: {trend_1m} | 5-min Trend: {trend_5m} | 15-min Trend: {trend_15m}
+- All Aligned? {timeframes_aligned} (true/false) | Direction: {aligned_direction}
 
 LAST 5 COMPLETED CANDLES (5-min, newest first):
 {last_5_candles}
 
-YOUR TASK:
-Predict what Bank Nifty will do in the NEXT {target_minutes} MINUTES.
-You are also given recent_ohlcv_bars in the user payload: use the full raw window (normally the latest 120 bars)
-to judge trend persistence, pullbacks, breakouts, and lower-high/lower-low or higher-high/higher-low structure.
+═══════════════════════════════════════════════════════
+POST-AI GUARDRAILS — READ BEFORE ANSWERING
+═══════════════════════════════════════════════════════
 
 TREND CONTEXT (deterministic, multi-timeframe):
-The user payload contains a trend_context object computed directly from OHLCV with keys:
+The user payload contains a trend_context object computed directly from OHLCV with keys
 regime (combined), primary_regime (5-min), higher_regime (15-min), agreement (bool),
-primary_score, higher_score (each in roughly −5..+5), and reasons describing why each
+primary_score, higher_score (each roughly −5..+5), and reasons describing why each
 timeframe is labelled UPTREND / DOWNTREND / SIDEWAYS / UNKNOWN. Treat this as a hard
 prior: if higher_regime is DOWNTREND, do not output BUY unless you have very strong
-reversal confirmation (e.g., bullish engulfing on heavy volume + RSI cross up from
-oversold + reclaim of VWAP). The same applies in reverse for SELL in an UPTREND.
-A post-AI guardrail in the service will downgrade BUY-in-DOWNTREND or SELL-in-UPTREND
-to HOLD unless deterministic reversal evidence (engulfing/hammer + volume spike + RSI
-zone turn + VWAP reclaim) is present, so do not emit speculative counter-trend calls.
+reversal confirmation (bullish engulfing on heavy volume + RSI cross up from oversold +
+reclaim of VWAP). The same applies in reverse for SELL in an UPTREND. A post-AI
+guardrail in the service will downgrade BUY-in-DOWNTREND or SELL-in-UPTREND to HOLD
+unless deterministic reversal evidence (engulfing/hammer + volume spike + RSI zone turn
++ VWAP reclaim) is present, so do not emit speculative counter-trend calls.
 
 VOLUME CONFIRMATION:
 A separate post-AI gate may force HOLD when last-bar volume vs the 20-bar average is
@@ -792,40 +872,290 @@ below the configured ratio (default disabled). When you see volume_ratio < 0.7 i
 indicators payload, treat the move as low-conviction and lean toward HOLD or, at minimum,
 reduce confidence by 10 points so the existing floor catches it.
 
-THINK THROUGH THIS STEP BY STEP BEFORE ANSWERING:
-1. TREND: Is EMA 20 above or below EMA 50? What is the slope — widening or narrowing?
-2. MOMENTUM: Is RSI overbought (>70), oversold (<30), or in the buy zone (55-70) / sell zone (30-45) / neutral (45-55)?
-3. PRICE vs VWAP: Is price above VWAP (institutional buying) or below (selling)? How far from VWAP?
-4. CANDLE PATTERN: Are the last 5 candles making higher highs (bullish) or lower lows (bearish)? Any reversal patterns (doji, hammer, engulfing)?
-5. OPTIONS DATA: PCR > 1.2 is bullish (put writers confident), PCR < 0.8 is bearish. If PCR/max pain are N/A, ignore this factor instead of treating it as bearish, neutral, or a HOLD reason.
-6. VOLATILITY: Is VIX rising (expect bigger move) or falling (expect range)? Use ATR to size stop loss realistically.
-7. SUPPORT/RESISTANCE: Is price near any key level? A bounce off support = BUY, rejection at resistance = SELL, breakout = strong move.
-8. TIME OF DAY: 9:15-9:30 = volatile/unreliable, 12:00-13:00 = low volume/choppy, 14:00-15:15 = trend resumes. Adjust confidence based on time.
-9. VOLUME: Volume > 1.5x average = conviction in the move. Volume < 0.7x = low conviction, prefer HOLD.
-10. CONFLUENCE: Count only available, non-N/A signals. For a clear directional market, BUY/SELL is valid with 3+ aligned signals when trend + price-vs-VWAP + momentum/candles agree. Use HOLD for conflict, chop, poor R:R, or true low confidence — not merely because one optional signal is unavailable.
+═══════════════════════════════════════════════════════
+YOUR TASK
+═══════════════════════════════════════════════════════
 
-STRICT RULES:
-1. If confidence < {min_confidence} → direction MUST be "HOLD". No exceptions.
-2. Risk-reward must be >= {min_risk_reward} for BUY or SELL. If ATR doesn't support a 1:{min_risk_reward} R:R within {target_minutes} minutes, use HOLD.
-3. stop_loss must be realistic — use 0.3x to 0.5x ATR from entry. Never equal to entry or target.
-4. target_price must be realistic — use 0.5x to 1.0x ATR from entry in the predicted direction.
-5. If RSI is between 45-55 AND price is within 0.1% of VWAP AND candles are not trending → this is a NO TRADE zone → HOLD.
-6. If only 15 minutes remain before market close (after 15:15 IST) → HOLD.
-7. If VIX > 20 → widen stop loss by 1.5x and reduce confidence by 10.
-8. magnitude = expected % move (positive for BUY, negative for SELL, 0 for HOLD).
-9. predicted_volatility = your estimate of annualized volatility based on current VIX and ATR.
-10. valid_minutes = how long this prediction stays valid (never more than {target_minutes}).
+Predict what Bank Nifty will do in the NEXT {target_minutes} MINUTES.
 
-CONFIDENCE CALIBRATION:
-- 90-100%: All 10 signals aligned + strong candle pattern + high volume breakout (extremely rare)
-- 75-89%: 7-8 signals aligned + clear trend + good volume
-- 65-74%: 3-6 available signals aligned + moderate directional conviction
-- Below {min_confidence}%: Not enough confluence → MUST output HOLD
+Analyze ALL 37 factors below step by step before answering.
+Each factor outputs ✓ (confirms trade), ✗ (denies), or — (neutral).
+Count total ✓ vs ✗ at the end.
 
-Respond with ONE JSON object only. No markdown, no backticks, no explanation outside the JSON.
-Keys EXACTLY: direction, entry_price, stop_loss, target_price, risk_reward, confidence, magnitude, predicted_volatility, valid_minutes, reason
+If a field is "N/A", treat that factor as — (neutral) and skip it. Do not
+manufacture data, and do not let an unavailable optional input (e.g. options
+chain, global cues) flip an otherwise clean local setup into HOLD.
 
-The "reason" field must be a single sentence citing the 2-3 strongest signals that drove your decision (e.g., "EMA bullish crossover + RSI 62 in buy zone + price bouncing off S1 support with 1.8x volume").\
+───────────────────────────────────────────────────────
+CORE ANALYSIS (Factors 1-10)
+───────────────────────────────────────────────────────
+
+1. TREND: EMA 20 vs 50 — bullish (20>50), bearish (20<50), or mixed (within 0.1%)? Is the gap widening (strengthening) or narrowing (weakening)? Also check if Supertrend agrees.
+
+2. MOMENTUM: RSI zone — overbought (>70), buy zone (55-70), neutral (45-55), sell zone (30-45), oversold (<30)? Check Stochastic for crossover confirmation. Check Williams %R for extreme readings.
+
+3. VWAP POSITION: Price above VWAP = institutional buying, below = selling. If within 0.1% of VWAP = no-trade zone. How far from VWAP determines conviction — farther = stronger signal.
+
+4. CANDLE PATTERN: Last 5 candles — higher highs/higher lows (bullish) or lower highs/lower lows (bearish)? Any reversal patterns: doji at resistance, hammer at support, engulfing candle, morning/evening star?
+
+5. PCR & OPTIONS FLOW: PCR >1.2 = bullish (put writers confident), <0.8 = bearish, 0.8-1.2 = neutral. Is PCR rising (getting more bullish) or falling? Where is max pain relative to spot — is spot being pulled toward it?
+
+6. VOLATILITY: VIX rising = expect bigger move, VIX falling = expect range. Bollinger squeeze (narrow width) = expansion imminent. Use ATR to determine realistic SL and target distances.
+
+7. SUPPORT/RESISTANCE: Is price near any level (S1, S2, R1, R2, PDH, PDL, pivot)? Bounce off support = buy signal. Rejection at resistance = sell. Break through with volume = trend continuation.
+
+8. TIME OF DAY:
+   - 9:15-9:30 = opening noise, AVOID.
+   - 9:30-11:30 = prime trading window.
+   - 12:00-13:00 = low volume/choppy, reduce confidence.
+   - 14:00-15:15 = afternoon trend resumes.
+   - After 15:15 = HOLD (not enough time).
+
+9. VOLUME: >1.5x 20d avg = strong conviction. 0.7-1.5x = normal. <0.7x = low conviction, prefer HOLD. Check OBV direction — OBV must agree with price direction.
+
+10. CONFLUENCE COUNT: Tally factors 1-9. Need 5+ aligned for BUY/SELL. 4 = borderline. <4 = HOLD.
+
+───────────────────────────────────────────────────────
+ADVANCED ANALYSIS (Factors 11-21)
+───────────────────────────────────────────────────────
+
+11. OI BUILDUP AT KEY STRIKES: Heavy Call OI at a strike = resistance wall. Heavy Put OI = support floor. If OI is unwinding (decreasing) at a level while price pushes through = real breakout. If OI is increasing while price pushes through = trap, will reverse.
+
+12. GAMMA EXPOSURE: Heavy OI clustered near spot = positive gamma = market makers hedge by selling rallies/buying dips = range-bound day. OI far from spot = negative gamma = moves get amplified = trending day. This determines if you should trade breakouts or mean-reversion.
+
+13. IV SKEW: Put IV >> Call IV = fear premium, market expects downside. Call IV rising suddenly = someone buying upside aggressively. IV crush (both dropping) = move exhausted, range ahead. IV skew shifts often precede actual price moves by 5-15 minutes.
+
+14. GLOBAL CONTEXT: Does SGX Nifty / US futures / Asian market direction support or oppose the local Bank Nifty setup? A locally bullish setup with global bearish context = reduce confidence by 10.
+
+15. FII POSITIONING: FII long/short ratio >1.5 = institutional bullish backing. <0.7 = bearish pressure. Sudden overnight change = possible regime shift.
+
+16. GAP ANALYSIS:
+    - Gap up >0.5% that holds above prev high after 30 min → bullish continuation.
+    - Gap up that fills (returns to prev close) within 30 min → bull trap → go bearish.
+    - Gap down >0.5% that reverses above VWAP → V-recovery → go bullish.
+    - Gap down that stays below VWAP → bearish continuation.
+
+17. MULTI-TIMEFRAME ALIGNMENT:
+    - 1m + 5m + 15m all agree → HIGH conviction.
+    - 5m agrees with 15m but 1m diverges → moderate, timing issue.
+    - 5m disagrees with 15m → LOW conviction, reduce size.
+    - All three diverge → HOLD.
+
+18. PREV DAY STRUCTURE:
+    - Closed in top 25% of range → bullish carry-over.
+    - Closed in bottom 25% → bearish carry-over.
+    - Yesterday's range < 0.7x ATR → squeeze, expect expansion TODAY.
+    - Yesterday's range > 1.5x ATR → exhaustion, expect contraction today.
+
+19. EXPIRY BEHAVIOR (if expiry day):
+    - Price gravitates toward max pain by afternoon.
+    - Theta decay accelerates: 60% of premium gone by noon, 97% by 3:20 PM.
+    - Gamma explodes: 100pt Bank Nifty move = 60-80pt premium swing (vs 30-40 non-expiry).
+    - Pin risk at high OI strikes after 1 PM.
+    - Best buyer window: 9:30-11:30 AM. After noon, only sellers benefit.
+
+20. EVENT PROXIMITY:
+    - Major event within 30 min → HOLD regardless of all other signals.
+    - Event just passed + direction established → trade with wider SL.
+    - RBI day / Fed day / bank earnings → expect 2x normal range.
+
+21. PRICE ACCEPTANCE:
+    - Price held above resistance for 15+ min → accepted, old resistance = new support.
+    - Price held below support for 15+ min → accepted, old support = new resistance.
+    - Quick spike through level that returns within 5 min → rejection, level held.
+
+───────────────────────────────────────────────────────
+EXPIRY-SPECIFIC FACTORS (Factors 22-30, apply on expiry days only)
+───────────────────────────────────────────────────────
+
+22. THETA DECAY CURVE:
+    - 9:15 AM premium → by 12 PM: -60% → by 2 PM: -83% → by 3:20 PM: -97%.
+    - After 12 PM: do NOT buy OTM. ATM or 1-strike ITM only.
+    - After 2 PM: only option SELLERS should be active.
+
+23. MAX PAIN GRAVITY:
+    - Bank Nifty closes within 200 pts of max pain ~56% of the time.
+    - Spot far from max pain morning → expect pull toward it afternoon.
+    - Spot already near max pain by 11 AM → range-bound, sell premium.
+    - Spot breaks past max pain with high volume → theory fails, ride the trend.
+    - Check max pain at 3 times: previous evening, 9:30 AM, 12 PM.
+
+24. GAMMA EXPLOSION:
+    - ATM option sensitivity is 2x on expiry vs non-expiry.
+    - Reduce position size by 50% to account for amplified P&L swings.
+    - Use spreads, not naked positions.
+
+25. PIN RISK:
+    - High OI strikes act as magnets after 1 PM on expiry.
+    - If spot is within 100 pts of a high OI strike after 1 PM → HOLD (pinning).
+
+26. IV CRUSH:
+    - IV drops sharply after 12 PM on expiry.
+    - Buyers: enter before 11:30 AM while IV supports premium.
+    - Sellers: sell after 9:45 AM. IV crush is your tailwind.
+
+27. EXPIRY TIME WINDOWS:
+    - 9:15-9:30: NO TRADE (opening noise).
+    - 9:30-9:45: Direction established, first entry window.
+    - 9:45-11:30: BEST window for buyers.
+    - 11:30-12:00: Midday decision — breakout or range?
+    - 12:00-2:00: Only sellers. Theta acceleration zone.
+    - 2:00-3:00: DANGER for buyers. Only established seller positions.
+    - 3:00-3:30: Exit ALL by 3:20 PM. Extreme gamma swings.
+
+28. ROLLOVER ANALYSIS (monthly expiry):
+    - Rollover >75% → institutions carrying positions → trend continues next month.
+    - Rollover <60% → closing positions → possible reversal.
+    - Rollover at higher prices → bullish next month. Lower → bearish.
+
+29. MONTHLY EXPIRY SPECIFICS:
+    - 2-3x higher volume than weekly. Sharper moves.
+    - PCR can swing to extremes (>1.8 or <0.5) — normal on monthly, don't panic.
+    - Max pain less reliable on monthly. Trust price action and volume more.
+    - Position size: 50% of normal.
+
+30. SERIES TRANSITION (monthly expiry):
+    - After 1 PM, analyze next month's OI for forward bias.
+    - Heavy put writing in next month at a strike → next month's support floor.
+    - Next month IV significantly higher than current → big move expected ahead.
+
+───────────────────────────────────────────────────────
+FAKE BREAKOUT DETECTION (Factors 31-37)
+───────────────────────────────────────────────────────
+
+When price breaks above resistance or below support, run these 7 checks before confirming:
+
+31. VOLUME CONFIRMATION:
+    - Breakout candle volume must be > 1.5x 20-period average.
+    - Next 2 candles should also be above average.
+    - OBV must confirm direction. Price up + OBV flat = fake.
+    - No volume confirmation = NO entry. Period.
+
+32. CANDLE CLOSE vs WICK:
+    - Candle BODY must close beyond the level, not just the wick.
+    - Wick > 50% of total range at breakout level = rejection = fake.
+    - Body ratio must be > 0.6 for convincing breakout.
+    - Doji / spinning top at breakout level = fake.
+
+33. TIME ACCEPTANCE:
+    - Price must hold beyond level for 3 consecutive 5-min candles (15 min).
+    - Returns within 1-2 candles = fake, avoid.
+    - Hovering at the level = indecision, wait.
+
+34. RSI DIVERGENCE AT BREAKOUT:
+    - Price new high + RSI lower high = bearish divergence = FAKE.
+    - Price new low + RSI higher low = bullish divergence = FAKE breakdown.
+    - RSI should be >55 rising (bullish breakout) or <45 falling (bearish).
+    - RSI 45-55 at breakout = no momentum = weak/fake.
+
+35. OI BEHAVIOR AT BREAKOUT STRIKE:
+    - REAL: OI at breakout strike DECREASING (writers surrendering).
+    - FAKE: OI at breakout strike INCREASING (writers doubling down, expect reversal).
+    - Also check: is fresh OI building at the NEXT strike? Yes = real.
+
+36. MULTI-TIMEFRAME BREAKOUT CHECK:
+    - 5-min breakout AGAINST 15-min trend = 80% fake.
+    - Must align with higher timeframe.
+    - 1-min RSI already >75 at breakout moment = exhaustion, will reverse.
+
+37. RETEST CONFIRMATION:
+    - Safest entry: wait for price to pull back and retest the broken level.
+    - Retest bounces = confirmed real → enter here.
+    - Retest breaks back through = was fake → do NOT enter.
+    - Missing a fast breakout > entering a fake one.
+
+BREAKOUT SCORE (count confirmed signals out of 7):
+    - 6-7/7 = REAL → enter with full conviction.
+    - 4-5/7 = MODERATE → enter with half size, tighter SL.
+    - 2-3/7 = LIKELY FAKE → HOLD.
+    - 0-1/7 = DEFINITELY FAKE → FADE it (trade opposite direction).
+
+═══════════════════════════════════════════════════════
+STRICT RULES
+═══════════════════════════════════════════════════════
+
+CONFIDENCE RULES:
+1. Confidence < {min_confidence} → direction = "HOLD". No exceptions.
+2. Risk-reward must be >= {min_risk_reward} for BUY or SELL. If not achievable → HOLD.
+3. stop_loss is mandatory. Use 0.3-0.5x ATR. Never equals entry or target.
+4. target_price: Use 0.5-1.0x ATR in predicted direction.
+
+MARKET CONDITION RULES:
+5. RSI 45-55 AND price within 0.1% of VWAP → NO TRADE ZONE → HOLD.
+6. After 15:15 IST → HOLD (not enough time).
+7. VIX > 20 → widen SL by 1.5x AND reduce confidence by 10.
+8. Volume < 0.7x avg → reduce confidence by 15.
+9. Global cues strongly oppose local setup → reduce confidence by 10.
+10. Event within 30 minutes → HOLD regardless of all signals.
+
+BREAKOUT RULES:
+11. Never enter on unclosed breakout candle. Wait for close.
+12. Breakout volume < 1.5x avg → classify as fake → HOLD.
+13. RSI divergence at breakout → classify as fake → HOLD.
+14. OI increasing at breakout strike → classify as fake → HOLD.
+15. Breakout against 15-min trend → reduce confidence by 20.
+16. Breakout score ≤ 3/7 → HOLD. State "likely fake breakout" in reason.
+17. Failed breakout (returned within 15 min) → FADE signal → trade opposite direction.
+
+EXPIRY DAY RULES (override general rules):
+18. Expiry before 9:45 AM → HOLD.
+19. Expiry after 2:00 PM → HOLD for buyers. Only SELL signals valid.
+20. Expiry SL: 0.2-0.3x ATR (tighter than normal).
+21. Expiry target: 0.3-0.5x ATR (quicker profits).
+22. Expiry + spot within 100 pts of max pain after 1 PM → HOLD (pin risk).
+23. Expiry → reduce all confidence by 5 points.
+24. Expiry + VIX > 18 → reduce confidence additional 10.
+25. Monthly expiry → include "MONTHLY EXPIRY — half size" in reason.
+26. Expiry + premium < ₹20 after 1 PM → HOLD (not enough meat).
+27. Expiry + fewer than 4 factors aligned → HOLD.
+
+MAGNITUDE & VOLATILITY:
+28. magnitude = expected % move. Positive for BUY, negative for SELL, 0 for HOLD.
+29. predicted_volatility = annualized vol estimate based on VIX + ATR.
+30. valid_minutes = how long prediction stays valid. Never > {target_minutes}. Reduce if near event or market close.
+
+═══════════════════════════════════════════════════════
+CONFIDENCE CALIBRATION
+═══════════════════════════════════════════════════════
+
+NON-EXPIRY DAYS:
+- 90-100%: 30+ of 37 factors aligned + breakout with 2x volume + all TFs agree (1-2x per week max)
+- 80-89%: 25-29 factors + strong trend + good volume + options flow confirms
+- 70-79%: 20-24 factors + clear direction + moderate volume
+- 65-69%: 17-19 factors + some conflicts but majority agrees
+- Below {min_confidence}%: Insufficient → MUST output HOLD
+
+EXPIRY DAYS:
+- 85-100%: 28+ factors + strong gap + 2x volume + trend by 10 AM (very rare)
+- 75-84%: 23-27 factors + direction clear + healthy premium + before 12 PM
+- 65-74%: 18-22 factors + moderate conviction + must be before 11:30 AM for buyers
+- Below {min_confidence}%: HOLD. Marginal setups lose to theta + gamma on expiry.
+
+═══════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════
+
+Respond with ONE JSON object only.
+No markdown fences. No backticks. No explanation outside JSON.
+
+Keys EXACTLY:
+  direction, entry_price, stop_loss, target_price, risk_reward,
+  confidence, magnitude, predicted_volatility, valid_minutes, reason
+
+DIRECTION values: "BUY", "SELL", or "HOLD"
+
+REASON format — single sentence citing:
+  - The 3-4 STRONGEST signals driving the decision
+  - If breakout: state REAL/FAKE + score (X/7)
+  - If expiry: mention expiry-specific factor
+  - If HOLD: state the 1-2 reasons blocking the trade
+
+Examples:
+  "BUY: EMA20>50 widening + RSI 63 buy zone + price 0.4% above VWAP with 2.1x volume + put OI floor at 51000 holding. Breakout score 5/7."
+  "SELL: Bearish engulfing at R1 + RSI 38 sell zone + PCR 0.72 bearish + FII net short. IV skew confirms downside expectation."
+  "HOLD: RSI neutral (48.2) in no-trade zone + volume only 0.6x avg + conflicting timeframes (5m bullish, 15m bearish). Only 3/10 core signals aligned."
+  "HOLD: FAKE breakout above 52000 (score 2/7) — volume 0.9x avg + RSI divergence + call OI increasing at strike. Waiting for retest."
+  "SELL (FADE): Failed breakout above 52000 returned in 8 min. Volume trap + OI adding. Fading with SL above 52050. WEEKLY EXPIRY — half size."\
 """
 
 
@@ -971,9 +1301,17 @@ def _policy(key: str) -> Any:
 
 
 class _SafeDict(dict):
-    """dict subclass that leaves unknown {key} placeholders intact instead of raising KeyError."""
+    """dict subclass that returns ``"N/A"`` for unknown ``{key}`` placeholders.
+
+    The convention across the prompt is that unsupplied data fields render as
+    ``N/A`` so the AI ignores them per its strict rules ("If PCR/max pain are
+    N/A, ignore this factor"). Returning the literal ``{key}`` would leak
+    template syntax into the rendered prompt and confuse the model — Gemini
+    frequently then echoed the placeholders back in its rationale.
+    """
+
     def __missing__(self, key: str) -> str:
-        return "{" + key + "}"
+        return "N/A"
 
 
 def _fmt(v: Any, decimals: int = 2) -> str:
@@ -993,8 +1331,14 @@ def _build_snapshot_context(
     checklist_signal: dict[str, Any],
     realtime: dict[str, Any],
     target_minutes: int,
+    trend_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compute all named substitution values for the system prompt template."""
+    """Compute all named substitution values for the system prompt template.
+
+    Any placeholder we cannot derive falls through ``_SafeDict.__missing__`` and
+    renders as ``"N/A"`` so the AI ignores it (matches the strict-rules contract
+    "If PCR/max pain are N/A, ignore this factor").
+    """
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -1003,8 +1347,9 @@ def _build_snapshot_context(
 
     spot = float(realtime.get("price") or 0)
 
-    # Today's OHLC and previous close — group by IST date
+    # ── Today vs previous trading session ───────────────────────────────────
     today_df = pd.DataFrame()
+    prev_df = pd.DataFrame()
     prev_close = spot
     try:
         idx = ohlcv.index
@@ -1012,12 +1357,18 @@ def _build_snapshot_context(
             idx_ist = idx.tz_localize("UTC").tz_convert(IST)
         else:
             idx_ist = idx.tz_convert(IST)
+        date_keys = [d.strftime("%Y-%m-%d") for d in idx_ist]
         today_str = now_ist.strftime("%Y-%m-%d")
-        today_mask = [d.strftime("%Y-%m-%d") == today_str for d in idx_ist]
+        today_mask = [k == today_str for k in date_keys]
         today_df = ohlcv[today_mask]
         not_today = ohlcv[[not m for m in today_mask]]
-        if not not_today.empty:
+        not_today_dates = [k for k in date_keys if k != today_str]
+        if not not_today.empty and not_today_dates:
             prev_close = float(not_today["close"].iloc[-1])
+            # Most recent date that is not today
+            last_prev_date = not_today_dates[-1]
+            prev_mask = [k == last_prev_date for k in date_keys]
+            prev_df = ohlcv[prev_mask]
     except Exception:
         pass
 
@@ -1028,13 +1379,148 @@ def _build_snapshot_context(
     else:
         today_open = today_high = today_low = spot
 
-    day_change_pct = round((spot - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+    if not prev_df.empty:
+        prev_high = float(prev_df["high"].max())
+        prev_low = float(prev_df["low"].min())
+        prev_open = float(prev_df["open"].iloc[0])
+    else:
+        prev_high = prev_low = prev_open = prev_close
 
-    # Levels from checklist
+    day_change_pct = round((spot - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+    gap_pct = round((today_open - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+    prev_range = round(prev_high - prev_low, 2)
+
+    # Where did yesterday's close sit inside yesterday's range? Top/mid/bottom quartile.
+    prev_close_position = "N/A"
+    if prev_range > 0:
+        ratio = (prev_close - prev_low) / prev_range
+        if ratio >= 0.75:
+            prev_close_position = "top"
+        elif ratio <= 0.25:
+            prev_close_position = "bottom"
+        else:
+            prev_close_position = "mid"
+
+    # Range vs ATR — squeeze (<0.7), normal (0.7–1.5), expansion (>1.5).
+    atr_14 = indicators.get("atr_14")
+    range_vs_atr = "N/A"
+    if atr_14 and float(atr_14) > 0 and prev_range > 0:
+        ratio = prev_range / float(atr_14)
+        if ratio < 0.7:
+            range_vs_atr = "squeeze"
+        elif ratio > 1.5:
+            range_vs_atr = "expansion"
+        else:
+            range_vs_atr = "normal"
+
+    # ── Indicator-derived fields ────────────────────────────────────────────
+    ema_20 = indicators.get("ema_20")
+    ema_50 = indicators.get("ema_50")
+    ema_slope = "N/A"
+    if ema_20 is not None and ema_50 is not None:
+        try:
+            gap_pct_emas = (float(ema_20) - float(ema_50)) / float(ema_50) * 100
+            if abs(gap_pct_emas) < 0.05:
+                ema_slope = "crossed"
+            elif gap_pct_emas > 0:
+                ema_slope = "widening" if float(indicators.get("ema9_above_ema21") or False) else "narrowing"
+            else:
+                ema_slope = "narrowing"
+        except (TypeError, ValueError):
+            pass
+
+    macd_hist = indicators.get("macd_hist")
+    macd_hist_direction = "N/A"
+    try:
+        if macd_hist is not None:
+            macd_hist_direction = "growing" if float(macd_hist) > 0 else "shrinking"
+    except (TypeError, ValueError):
+        pass
+
+    # Bollinger position from %B (0=lower band, 1=upper band).
+    bb_pct = indicators.get("bb_pct")
+    bb_position = "N/A"
+    try:
+        if bb_pct is not None:
+            v = float(bb_pct)
+            if v > 1.0:
+                bb_position = "above-upper"
+            elif v < 0.0:
+                bb_position = "below-lower"
+            elif 0.4 <= v <= 0.6:
+                bb_position = "mid"
+            elif v > 0.6:
+                bb_position = "upper-half"
+            else:
+                bb_position = "lower-half"
+    except (TypeError, ValueError):
+        pass
+
+    # ── Levels from checklist ───────────────────────────────────────────────
     step2 = checklist_signal.get("step2_vwap") or {}
     step5 = checklist_signal.get("step5_levels") or {}
 
-    # VIX value and % change vs previous bar
+    # VWAP relationship — % and absolute distance.
+    vwap_value = step2.get("vwap")
+    price_vs_vwap = "N/A"
+    vwap_distance = "N/A"
+    try:
+        if vwap_value and float(vwap_value) > 0:
+            price_vs_vwap = round((spot - float(vwap_value)) / float(vwap_value) * 100, 3)
+            vwap_distance = round(spot - float(vwap_value), 2)
+    except (TypeError, ValueError):
+        pass
+
+    # Central Pivot Range — needs prev day high/low/close.
+    cpr_high = cpr_low = cpr_width = "N/A"
+    try:
+        if prev_range > 0:
+            piv = (prev_high + prev_low + prev_close) / 3
+            bc = (prev_high + prev_low) / 2
+            tc = 2 * piv - bc
+            cpr_high = round(max(tc, bc), 2)
+            cpr_low = round(min(tc, bc), 2)
+            cpr_width = round(cpr_high - cpr_low, 2)
+    except Exception:
+        pass
+
+    # Nearest support / resistance — closest of {S1, S2, R1, R2, PDH, PDL}.
+    levels = {
+        "S1": step5.get("s1"),
+        "S2": step5.get("s2"),
+        "R1": step5.get("r1"),
+        "R2": step5.get("r2"),
+        "PDH": prev_high,
+        "PDL": prev_low,
+    }
+    nearest_above = None  # resistance
+    nearest_below = None  # support
+    for name, raw in levels.items():
+        if raw is None:
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if v > spot and (nearest_above is None or v < nearest_above[1]):
+            nearest_above = (name, v)
+        elif v < spot and (nearest_below is None or v > nearest_below[1]):
+            nearest_below = (name, v)
+    resistance_nearest = f"{nearest_above[0]}@{nearest_above[1]:.2f}" if nearest_above else "N/A"
+    support_nearest = f"{nearest_below[0]}@{nearest_below[1]:.2f}" if nearest_below else "N/A"
+    resistance_dist = round(nearest_above[1] - spot, 2) if nearest_above else "N/A"
+    support_dist = round(spot - nearest_below[1], 2) if nearest_below else "N/A"
+
+    # ── Volume from latest bar ──────────────────────────────────────────────
+    volume_current: Any = "N/A"
+    try:
+        valid_volume = ohlcv[ohlcv["high"].astype(float) > 0]
+        if not valid_volume.empty:
+            volume_current = int(float(valid_volume["volume"].iloc[-1]))
+    except Exception:
+        pass
+
+    # ── VIX value and % change ──────────────────────────────────────────────
     india_vix_val: Any = "N/A"
     vix_change_val: Any = "N/A"
     if not vix.empty and "close" in vix.columns:
@@ -1044,7 +1530,7 @@ def _build_snapshot_context(
         if len(vc) >= 2 and float(vc.iloc[-2]) != 0:
             vix_change_val = round((float(vc.iloc[-1]) - float(vc.iloc[-2])) / float(vc.iloc[-2]) * 100, 2)
 
-    # Market phase
+    # ── Calendar: market phase + expiry day type ────────────────────────────
     hm = now_ist.hour * 100 + now_ist.minute
     if hm < 930:
         market_phase = "Opening — high volatility (9:15–9:30)"
@@ -1057,7 +1543,16 @@ def _build_snapshot_context(
     else:
         market_phase = "Pre-close — thin market, avoid new entries (15:00–15:30)"
 
-    # Last 5 completed candles (newest first)
+    day_type, dte = _expiry_classification(now_ist.date())
+
+    # ── Multi-timeframe trend (re-uses the existing detector) ──────────────
+    tc = trend_context or {}
+    trend_5m = (tc.get("primary_regime") or "N/A").upper() if isinstance(tc.get("primary_regime"), str) else "N/A"
+    trend_15m = (tc.get("higher_regime") or "N/A").upper() if isinstance(tc.get("higher_regime"), str) else "N/A"
+    timeframes_aligned = bool(tc.get("agreement", False)) if tc else "N/A"
+    aligned_direction = (tc.get("regime") or "N/A").upper() if isinstance(tc.get("regime"), str) else "N/A"
+
+    # ── Last 5 completed candles (newest first) ─────────────────────────────
     valid = ohlcv[ohlcv["high"].astype(float) > 0]
     tail = valid.iloc[-6:-1] if len(valid) >= 6 else valid.iloc[:-1]
     lines: list[str] = []
@@ -1079,41 +1574,88 @@ def _build_snapshot_context(
         "high":          _fmt(today_high),
         "low":           _fmt(today_low),
         "prev_close":    _fmt(prev_close),
+        "prev_high":     _fmt(prev_high),
+        "prev_low":      _fmt(prev_low),
         "day_change_pct": _fmt(day_change_pct),
+        "gap_pct":       _fmt(gap_pct),
+        "prev_close_position": prev_close_position,
+        "prev_range":    _fmt(prev_range),
+        "range_vs_atr":  range_vs_atr,
         # EMAs
-        "ema_20":        _fmt(indicators.get("ema_20")),
-        "ema_50":        _fmt(indicators.get("ema_50")),
+        "ema_9":         _fmt(indicators.get("ema_9")),
+        "ema_20":        _fmt(ema_20),
+        "ema_50":        _fmt(ema_50),
+        "ema_slope":     ema_slope,
         # Momentum
         "rsi_14":        _fmt(indicators.get("rsi_14"), 1),
-        "vwap":          _fmt(step2.get("vwap")),
-        "atr_14":        _fmt(indicators.get("atr_14")),
+        "vwap":          _fmt(vwap_value),
+        "price_vs_vwap": _fmt(price_vs_vwap, 3) if isinstance(price_vs_vwap, (int, float)) else price_vs_vwap,
+        "vwap_distance": _fmt(vwap_distance) if isinstance(vwap_distance, (int, float)) else vwap_distance,
+        "atr_14":        _fmt(atr_14),
         "macd":          _fmt(indicators.get("macd")),
         "macd_signal":   _fmt(indicators.get("macd_signal")),
-        "macd_histogram": _fmt(indicators.get("macd_hist")),
+        "macd_histogram": _fmt(macd_hist),
+        "macd_hist_direction": macd_hist_direction,
         # Volatility
+        "bb_width":      _fmt(indicators.get("bb_width")),
+        "bb_position":   bb_position,
         "india_vix":     _fmt(india_vix_val),
         "vix_change":    _fmt(vix_change_val),
-        # Options data (no source — shown as N/A)
-        "pcr_oi":        "N/A",
-        "pcr_volume":    "N/A",
-        "max_pain":      "N/A",
         # Volume
+        "volume_current": volume_current,
         "volume_ratio":  _fmt(indicators.get("volume_ratio")),
         # Levels
+        "pivot":         _fmt(step5.get("pivot")),
         "support_1":     _fmt(step5.get("s1")),
         "support_2":     _fmt(step5.get("s2")),
         "resistance_1":  _fmt(step5.get("r1")),
         "resistance_2":  _fmt(step5.get("r2")),
-        "pivot":         _fmt(step5.get("pivot")),
-        # Context
+        "cpr_high":      _fmt(cpr_high) if isinstance(cpr_high, (int, float)) else cpr_high,
+        "cpr_low":       _fmt(cpr_low) if isinstance(cpr_low, (int, float)) else cpr_low,
+        "cpr_width":     _fmt(cpr_width) if isinstance(cpr_width, (int, float)) else cpr_width,
+        # Breakout proximity
+        "resistance_nearest": resistance_nearest,
+        "resistance_dist":    _fmt(resistance_dist) if isinstance(resistance_dist, (int, float)) else resistance_dist,
+        "support_nearest":    support_nearest,
+        "support_dist":       _fmt(support_dist) if isinstance(support_dist, (int, float)) else support_dist,
+        # Calendar
         "market_phase":  market_phase,
         "time_ist":      now_ist.strftime("%H:%M IST"),
+        "day_type":      day_type,
+        "dte":           dte,
+        # Multi-timeframe (1-min trend not separately maintained — trend_context is 5m+15m)
+        "trend_5m":              trend_5m,
+        "trend_15m":             trend_15m,
+        "timeframes_aligned":    timeframes_aligned,
+        "aligned_direction":     aligned_direction,
+        # Tail
         "last_5_candles": last_5_candles,
         # Policy
-        "target_minutes": target_minutes,
-        "min_confidence": _policy("min_confidence"),
+        "target_minutes":  target_minutes,
+        "min_confidence":  _policy("min_confidence"),
         "min_risk_reward": _policy("min_risk_reward"),
     }
+
+
+def _expiry_classification(today_date) -> tuple[str, int]:
+    """Classify today as Non-Expiry / Weekly-Expiry / Monthly-Expiry and return DTE.
+
+    Bank Nifty derivatives expire **every Thursday** (weekly), with the **last
+    Thursday of the month** acting as the monthly expiry. Both AI rules and
+    backtest tooling care about this distinction. Returns ``("Non-Expiry", N)``
+    when today is not a Thursday, where N is the number of calendar days to
+    the next Thursday.
+    """
+    from datetime import timedelta
+
+    weekday = today_date.weekday()  # Mon=0, Thu=3
+    days_to_thu = (3 - weekday) % 7
+    if days_to_thu == 0:
+        # Last Thursday of the calendar month → monthly expiry.
+        next_thu = today_date + timedelta(days=7)
+        is_monthly = next_thu.month != today_date.month
+        return ("Monthly-Expiry" if is_monthly else "Weekly-Expiry", 0)
+    return ("Non-Expiry", days_to_thu)
 
 
 _TREND_CONTEXT_GUIDANCE = (
@@ -1348,6 +1890,29 @@ def _coerce_result(
         gates["dead_market"] = True
         direction = "HOLD"
 
+    # ── Outcome-driven confidence calibration (Phase 4.3) ───────────────
+    # Map Gemini's raw confidence to a calibrated probability backed by the
+    # historical hit-rate of past directional predictions, when an active
+    # calibration map exists. Inactive (cold-start) → identity passthrough.
+    raw_confidence = confidence
+    try:
+        from app.inference.calibration import get_calibration_store
+        _cal = get_calibration_store()
+        if _cal.is_active() and model_direction in ("BUY", "SELL"):
+            calibrated = _cal.apply(raw_confidence)
+            if abs(calibrated - raw_confidence) >= 0.5:
+                logger.info(
+                    "{} Calibration: raw_conf={:.1f}% → calibrated={:.1f}% (model_direction={})",
+                    log_pfx, raw_confidence, calibrated, model_direction,
+                )
+            confidence = float(calibrated)
+            gates["calibration_applied"] = True
+        else:
+            gates["calibration_applied"] = False
+    except Exception as e:  # noqa: BLE001 — calibration must never break inference
+        logger.warning("{} Calibration apply failed (using raw confidence): {}", log_pfx, e)
+        gates["calibration_applied"] = False
+
     eff_floor = _effective_confidence_floor(
         model_direction, indicators, checklist_signal, realtime_price, trend_context
     )
@@ -1531,7 +2096,11 @@ def _coerce_result(
     gates_summary = {
         "model_direction": model_direction,
         "final_direction": direction,
-        "raw_confidence": round(confidence, 2),
+        # NB: ``raw_confidence`` is the value Gemini emitted; ``confidence`` (above)
+        # is post-calibration. They are equal when calibration is inactive.
+        "raw_confidence": round(raw_confidence, 2),
+        "calibrated_confidence": round(confidence, 2),
+        "calibration_applied": bool(gates.get("calibration_applied", False)),
         "effective_confidence_floor": round(eff_floor, 2),
         "raw_risk_reward": round(risk_reward, 2) if risk_reward else None,
         "min_risk_reward": round(min_rr, 2),
@@ -1707,7 +2276,8 @@ class GeminiPredictor:
         })
 
         snapshot_ctx = _build_snapshot_context(
-            ohlcv, vix, indicators, checklist_signal, realtime, target_minutes
+            ohlcv, vix, indicators, checklist_signal, realtime, target_minutes,
+            trend_context=trend_context,
         )
 
         user_payload = {
@@ -1939,6 +2509,9 @@ class GeminiPredictor:
             "model_direction": diag.get("model_direction"),
             "final_direction": result.get("direction"),
             "confidence": result.get("confidence"),
+            "raw_confidence": diag.get("raw_confidence"),
+            "calibrated_confidence": diag.get("calibrated_confidence"),
+            "calibration_applied": diag.get("calibration_applied"),
             "effective_floor": diag.get("effective_confidence_floor"),
             "magnitude": result.get("magnitude"),
             "risk_reward": result.get("risk_reward"),
@@ -1987,14 +2560,19 @@ class GeminiPredictor:
         }
         _log_marker("PRED_RESULT", pid, payload)
         # Keep the human-friendly compact summary too — easy to read in tail logs.
+        cal_applied = bool(diag.get("calibration_applied"))
+        cal_suffix = (
+            f" (raw={diag.get('raw_confidence')}%)" if cal_applied else ""
+        )
         logger.info(
-            "[pid={}] DONE [{}min] model={}→final={} | conf={:.0f}% (floor={}) | "
+            "[pid={}] DONE [{}min] model={}→final={} | conf={:.0f}%{} (floor={}) | "
             "entry={} SL={} TP={} RR={} | gemini={}ms/{}attempts | regime={}",
             pid,
             target_minutes,
             diag.get("model_direction") or "?",
             result.get("direction") or "?",
             float(result.get("confidence") or 0.0),
+            cal_suffix,
             diag.get("effective_confidence_floor"),
             result.get("entry_price"),
             result.get("stop_loss"),

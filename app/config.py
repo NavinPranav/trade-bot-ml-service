@@ -89,6 +89,19 @@ class Settings(BaseSettings):
     gemini_429_max_retries: int = 4
     gemini_429_retry_base_delay_sec: float = 8.0
 
+    # Confidence calibration (Phase 4.3) — maps raw Gemini confidence to a
+    # historical-hit-rate-backed probability via histogram binning + PAV.
+    # Cold-start safe: stays inactive until ≥ ``calibration_min_samples`` resolved
+    # predictions are fitted. Override via env: SENSEX_CALIBRATION_MIN_SAMPLES=80.
+    calibration_n_bins: int = 10
+    calibration_min_samples: int = 50
+    calibration_prior_strength: float = 4.0
+    calibration_prior_win_rate: float = 0.5
+    # When fitting from the backend, default lookback / page size so the operator
+    # doesn't have to remember sensible numbers.
+    calibration_default_days: int = 30
+    calibration_default_limit: int = 2000
+
     # News API (newsapi.org) — financial sentiment enrichment
     news_api_key: str = ""
     news_fetch_interval_sec: int = 900   # 15-minute cache TTL (free tier: 100 req/day)

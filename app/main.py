@@ -392,6 +392,145 @@ async def delete_prediction_policy():
     return eff
 
 
+# ── Admin: confidence calibration (Phase 4.3) ───────────────────────────────
+#
+# Workflow:
+#   1. Operator collects resolved-prediction samples (raw confidence + win flag),
+#      either by calling the backend ``/api/admin/predictions/calibration-data``
+#      endpoint directly and POSTing the JSON here, or by passing
+#      ``backend_url`` + ``backend_token`` so this service does the fetch.
+#   2. ``POST /admin/calibration/refit`` fits an isotonic map and turns it on.
+#   3. ``GET /admin/calibration/status`` shows the current map and Brier deltas.
+#   4. ``DELETE /admin/calibration`` reverts to raw passthrough.
+#
+# The store is cold-start safe: until ``calibration_min_samples`` are supplied,
+# inference uses raw confidence and the existing 65 floor.
+
+
+class CalibrationSamplePayload(BaseModel):
+    confidence: float = Field(..., ge=0.0, le=100.0)
+    win: bool
+
+
+class CalibrationRefitRequest(BaseModel):
+    """Refit the calibration map.
+
+    Either pass ``samples`` inline OR ``backend_url`` + ``backend_token`` and the
+    service will pull from ``GET {backend_url}/api/admin/predictions/calibration-data``.
+    """
+
+    samples: Optional[List[CalibrationSamplePayload]] = None
+    horizon: Optional[str] = None
+    days: Optional[int] = None
+    limit: Optional[int] = None
+    backend_url: Optional[str] = None
+    backend_token: Optional[str] = None
+
+
+def _calibration_pull_from_backend(req: CalibrationRefitRequest) -> List[CalibrationSamplePayload]:
+    """Fetch resolved-prediction samples from the Java backend."""
+    if not req.backend_url:
+        raise HTTPException(status_code=400, detail="backend_url required when samples not provided")
+    base = req.backend_url.rstrip("/")
+    days = req.days or settings.calibration_default_days
+    limit = req.limit or settings.calibration_default_limit
+    params = {"days": int(days), "limit": int(limit)}
+    if req.horizon:
+        params["horizon"] = req.horizon
+    url = f"{base}/api/admin/predictions/calibration-data?{urlencode(params)}"
+    headers = {}
+    if req.backend_token:
+        headers["Authorization"] = f"Bearer {req.backend_token}"
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.get(url, headers=headers)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"backend fetch failed: {e}") from e
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"backend returned {resp.status_code}: {resp.text[:500]}",
+        )
+    body = resp.json()
+    raw_samples = body.get("samples") if isinstance(body, dict) else body
+    if not isinstance(raw_samples, list):
+        raise HTTPException(status_code=502, detail="backend response missing 'samples' list")
+    out: List[CalibrationSamplePayload] = []
+    for s in raw_samples:
+        try:
+            conf = float(s.get("confidence") or s.get("rawConfidence"))
+            win_field = s.get("win")
+            if win_field is None:
+                # Derive win from outcome data when the backend didn't pre-compute it.
+                pnl = s.get("actualPnlPct") or s.get("actual_pnl_pct")
+                if pnl is None:
+                    continue
+                win = float(pnl) > 0.0
+            else:
+                win = bool(win_field)
+            out.append(CalibrationSamplePayload(confidence=conf, win=win))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+@app.post("/admin/calibration/refit")
+async def refit_calibration(req: CalibrationRefitRequest):
+    from app.inference.calibration import CalibrationSample, get_calibration_store
+
+    if req.samples is None and not req.backend_url:
+        raise HTTPException(
+            status_code=400,
+            detail="provide either 'samples' (inline) or 'backend_url' to fetch from the Java backend",
+        )
+
+    payload_samples = req.samples or _calibration_pull_from_backend(req)
+    samples = [
+        CalibrationSample(confidence=float(s.confidence), win=bool(s.win))
+        for s in payload_samples
+    ]
+    store = get_calibration_store()
+    result = store.fit(samples, horizon_filter=req.horizon)
+    if result.get("active"):
+        logger.info(
+            "Calibration refit succeeded: n={} bins={}", result.get("n_samples"), result.get("n_bins")
+        )
+    else:
+        logger.info("Calibration refit deferred: {}", result)
+    return {"status": "ok", **result, "store": store.status()}
+
+
+@app.get("/admin/calibration/status")
+async def get_calibration_status():
+    from app.inference.calibration import get_calibration_store
+
+    store = get_calibration_store()
+    n_bins, min_samples, prior_n, prior_p = (
+        settings.calibration_n_bins,
+        settings.calibration_min_samples,
+        settings.calibration_prior_strength,
+        settings.calibration_prior_win_rate,
+    )
+    return {
+        "config": {
+            "n_bins": n_bins,
+            "min_samples": min_samples,
+            "prior_strength": prior_n,
+            "prior_win_rate": prior_p,
+        },
+        **store.status(),
+    }
+
+
+@app.delete("/admin/calibration")
+async def clear_calibration():
+    from app.inference.calibration import get_calibration_store
+
+    store = get_calibration_store()
+    store.clear()
+    return {"status": "ok", "message": "Calibration cleared; raw confidence in use"}
+
+
 # ── Admin news-sentiment debug endpoints ─────────────────────────────────────
 
 @app.get("/admin/news-sentiment")
