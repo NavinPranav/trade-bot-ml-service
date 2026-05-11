@@ -1218,6 +1218,71 @@ class _ChecklistWeightStore:
         return cls._weight
 
 
+class _ParameterTogglesStore:
+    """Singleton for the optional-input toggles wired in Phase 4.4.
+
+    The Java backend pushes a ``{key: enabled}`` map via ``PUT /admin/parameters``
+    on startup and after every admin change. ``predict()`` consults this store
+    before assembling the user payload and the snapshot context, so disabled
+    sections never reach Gemini.
+
+    Required keys (``ohlcv_bars`` / ``technical_indicators`` / ``current_price`` /
+    ``trend_context`` / ``target_minutes``) are not honoured by ``is_enabled`` —
+    they are always treated as ON regardless of the stored value, matching the
+    backend's refusal to disable required parameters. This is a defensive
+    second layer in case a stale or manual write reaches the store.
+    """
+
+    _DEFAULTS: dict[str, bool] = {
+        # Required (always ON, defensive)
+        "ohlcv_bars": True,
+        "technical_indicators": True,
+        "current_price": True,
+        "trend_context": True,
+        "target_minutes": True,
+        # Optional (operator-controllable)
+        "india_vix": True,
+        "checklist_signal": True,
+        "news_sentiment": True,
+        "previous_day_levels": True,
+        "support_resistance_levels": True,
+    }
+
+    _REQUIRED: frozenset[str] = frozenset({
+        "ohlcv_bars",
+        "technical_indicators",
+        "current_price",
+        "trend_context",
+        "target_minutes",
+    })
+
+    _toggles: dict[str, bool] = dict(_DEFAULTS)
+
+    @classmethod
+    def is_enabled(cls, key: str) -> bool:
+        if key in cls._REQUIRED:
+            return True
+        return bool(cls._toggles.get(key, cls._DEFAULTS.get(key, True)))
+
+    @classmethod
+    def update_many(cls, toggles: dict[str, Any]) -> dict[str, bool]:
+        """Replace the in-memory toggle map. Unknown keys are ignored, required
+        keys are forced back to ``True``."""
+        for k, v in toggles.items():
+            if k not in cls._DEFAULTS:
+                continue
+            cls._toggles[k] = True if k in cls._REQUIRED else bool(v)
+        return cls.to_dict()
+
+    @classmethod
+    def to_dict(cls) -> dict[str, bool]:
+        return dict(cls._toggles)
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._toggles = dict(cls._DEFAULTS)
+
+
 class _PredictionPolicyStore:
     """Admin-tunable prediction policy. Unset keys fall back to process env (Settings)."""
 
@@ -1849,6 +1914,7 @@ def _coerce_result(
     trend_context: Optional[dict[str, Any]] = None,
     ohlcv: Optional[pd.DataFrame] = None,
     pid: Optional[str] = None,
+    horizon: Optional[str] = None,
 ) -> Dict[str, Any]:
     # Model output before policy (confidence / R:R). Used so entry/SL/target in history
     # still reflect what Gemini predicted even when we downgrade the tradable signal to HOLD.
@@ -1890,28 +1956,39 @@ def _coerce_result(
         gates["dead_market"] = True
         direction = "HOLD"
 
-    # ── Outcome-driven confidence calibration (Phase 4.3) ───────────────
+    # ── Outcome-driven confidence calibration (Phase 4.3 + 4.5) ────────
     # Map Gemini's raw confidence to a calibrated probability backed by the
-    # historical hit-rate of past directional predictions, when an active
-    # calibration map exists. Inactive (cold-start) → identity passthrough.
+    # historical hit-rate of past directional predictions. Phase 4.5 picks
+    # the most-specific (direction, horizon) map available; ``apply_with_key``
+    # tells us which one was used so the gate diagnostics can attribute the
+    # adjustment. Inactive (cold-start) → identity passthrough.
     raw_confidence = confidence
+    calibration_key: Optional[tuple[str, str]] = None
     try:
         from app.inference.calibration import get_calibration_store
         _cal = get_calibration_store()
         if _cal.is_active() and model_direction in ("BUY", "SELL"):
-            calibrated = _cal.apply(raw_confidence)
-            if abs(calibrated - raw_confidence) >= 0.5:
+            calibrated, calibration_key = _cal.apply_with_key(
+                raw_confidence,
+                direction=model_direction,
+                horizon=horizon,
+            )
+            if calibration_key is not None and abs(calibrated - raw_confidence) >= 0.5:
                 logger.info(
-                    "{} Calibration: raw_conf={:.1f}% → calibrated={:.1f}% (model_direction={})",
-                    log_pfx, raw_confidence, calibrated, model_direction,
+                    "{} Calibration: raw_conf={:.1f}% → calibrated={:.1f}% "
+                    "(model_direction={}, horizon={}, key={}|{})",
+                    log_pfx, raw_confidence, calibrated, model_direction, horizon or "*",
+                    calibration_key[0], calibration_key[1],
                 )
             confidence = float(calibrated)
-            gates["calibration_applied"] = True
+            gates["calibration_applied"] = calibration_key is not None
         else:
             gates["calibration_applied"] = False
     except Exception as e:  # noqa: BLE001 — calibration must never break inference
         logger.warning("{} Calibration apply failed (using raw confidence): {}", log_pfx, e)
         gates["calibration_applied"] = False
+    if calibration_key is not None:
+        gates["calibration_key"] = f"{calibration_key[0]}|{calibration_key[1]}"
 
     eff_floor = _effective_confidence_floor(
         model_direction, indicators, checklist_signal, realtime_price, trend_context
@@ -2101,6 +2178,7 @@ def _coerce_result(
         "raw_confidence": round(raw_confidence, 2),
         "calibrated_confidence": round(confidence, 2),
         "calibration_applied": bool(gates.get("calibration_applied", False)),
+        "calibration_key": gates.get("calibration_key"),
         "effective_confidence_floor": round(eff_floor, 2),
         "raw_risk_reward": round(risk_reward, 2) if risk_reward else None,
         "min_risk_reward": round(min_rr, 2),
@@ -2250,22 +2328,29 @@ class GeminiPredictor:
         })
 
         checklist_weight = _ChecklistWeightStore.get()
-        try:
-            checklist_signal = run_checklist(ohlcv)
-        except Exception as e:
-            logger.warning("{} Checklist computation failed: {}", log_pfx, e)
-            checklist_signal = {"overall": "NO_DATA", "error": str(e)}
+        if _ParameterTogglesStore.is_enabled("checklist_signal"):
+            try:
+                checklist_signal = run_checklist(ohlcv)
+            except Exception as e:
+                logger.warning("{} Checklist computation failed: {}", log_pfx, e)
+                checklist_signal = {"overall": "NO_DATA", "error": str(e)}
+        else:
+            checklist_signal = {"overall": "DISABLED", "note": "Checklist signal disabled by admin"}
         _log_marker("PRED_CHECKLIST", pid, {
             "overall": checklist_signal.get("overall"),
             "weight_pct": checklist_weight,
             "step5_signal": (checklist_signal.get("step5_levels") or {}).get("signal"),
+            "enabled": _ParameterTogglesStore.is_enabled("checklist_signal"),
         })
 
-        try:
-            news_sentiment = get_news_sentiment()
-        except Exception as e:
-            logger.warning("{} News sentiment fetch failed: {}", log_pfx, e)
-            news_sentiment = {"overall": "UNAVAILABLE", "error": str(e)}
+        if _ParameterTogglesStore.is_enabled("news_sentiment"):
+            try:
+                news_sentiment = get_news_sentiment()
+            except Exception as e:
+                logger.warning("{} News sentiment fetch failed: {}", log_pfx, e)
+                news_sentiment = {"overall": "UNAVAILABLE", "error": str(e)}
+        else:
+            news_sentiment = {"overall": "DISABLED", "note": "News sentiment disabled by admin"}
         _log_marker("PRED_NEWS", pid, {
             "overall": news_sentiment.get("overall"),
             "score": news_sentiment.get("score"),
@@ -2273,14 +2358,35 @@ class GeminiPredictor:
             "bearish_count": news_sentiment.get("bearish_count"),
             "neutral_count": news_sentiment.get("neutral_count"),
             "fetched_at_ist": news_sentiment.get("fetched_at_ist"),
+            "enabled": _ParameterTogglesStore.is_enabled("news_sentiment"),
         })
 
         snapshot_ctx = _build_snapshot_context(
             ohlcv, vix, indicators, checklist_signal, realtime, target_minutes,
             trend_context=trend_context,
         )
+        # Phase 4.4 — strip placeholder values from the prompt for sections the
+        # admin has disabled. The _SafeDict fallback in _SYSTEM_PROMPT_TEMPLATE
+        # already prints "N/A" for missing keys, but here we explicitly mask
+        # the values so a disabled toggle visibly removes the data from the
+        # rendered prompt rather than silently leaking pre-computed numbers.
+        if not _ParameterTogglesStore.is_enabled("previous_day_levels"):
+            for k in ("prev_high", "prev_low", "prev_close", "prev_range",
+                      "prev_close_position", "range_vs_atr",
+                      "cpr_high", "cpr_low", "cpr_width"):
+                snapshot_ctx[k] = "N/A"
+        if not _ParameterTogglesStore.is_enabled("support_resistance_levels"):
+            for k in ("pivot", "support_1", "support_2", "resistance_1", "resistance_2",
+                      "resistance_nearest", "resistance_dist",
+                      "support_nearest", "support_dist"):
+                snapshot_ctx[k] = "N/A"
+        if not _ParameterTogglesStore.is_enabled("india_vix"):
+            snapshot_ctx["india_vix"] = "N/A"
+            snapshot_ctx["vix_change"] = "N/A"
 
-        user_payload = {
+        # Required keys are guaranteed; optional keys are added only when their
+        # toggle is on so Gemini cannot use a section the operator has disabled.
+        user_payload: dict[str, Any] = {
             "horizon": horizon,
             "target_minutes": target_minutes,
             "underlying_symbol": underlying_symbol or "BANKNIFTY",
@@ -2288,11 +2394,16 @@ class GeminiPredictor:
             "change_pct_today": round(realtime["change_pct"], 3),
             "recent_ohlcv_bars": _ohlcv_tail_records(ohlcv),
             "technical_indicators": indicators,
-            "india_vix": _vix_tail_summary(vix),
-            "checklist_signal": checklist_signal,
-            "news_sentiment": news_sentiment,
             "trend_context": trend_context,
         }
+        if _ParameterTogglesStore.is_enabled("india_vix"):
+            user_payload["india_vix"] = _vix_tail_summary(vix)
+        if _ParameterTogglesStore.is_enabled("checklist_signal"):
+            user_payload["checklist_signal"] = checklist_signal
+        if _ParameterTogglesStore.is_enabled("news_sentiment"):
+            user_payload["news_sentiment"] = news_sentiment
+
+        _log_marker("PRED_PARAMS", pid, _ParameterTogglesStore.to_dict())
         user_text = json.dumps(user_payload, default=str)
 
         system_prompt = _build_system_prompt(target_minutes, checklist_weight, snapshot_ctx)
@@ -2391,6 +2502,7 @@ class GeminiPredictor:
                     trend_context=trend_context,
                     ohlcv=ohlcv,
                     pid=pid,
+                    horizon=horizon,
                 )
                 self._log_pred_result(pid, horizon, sym, target_minutes, fb,
                                       gemini_latency_ms, gemini_attempts, status=429,
@@ -2418,6 +2530,7 @@ class GeminiPredictor:
                     trend_context=trend_context,
                     ohlcv=ohlcv,
                     pid=pid,
+                    horizon=horizon,
                 )
                 self._log_pred_result(pid, horizon, sym, target_minutes, fb,
                                       gemini_latency_ms, gemini_attempts, status=resp.status_code,
@@ -2469,6 +2582,7 @@ class GeminiPredictor:
             trend_context=trend_context,
             ohlcv=ohlcv,
             pid=pid,
+            horizon=horizon,
         )
 
         self._log_pred_result(pid, horizon, sym, target_minutes, result,
@@ -2512,6 +2626,7 @@ class GeminiPredictor:
             "raw_confidence": diag.get("raw_confidence"),
             "calibrated_confidence": diag.get("calibrated_confidence"),
             "calibration_applied": diag.get("calibration_applied"),
+            "calibration_key": diag.get("calibration_key"),
             "effective_floor": diag.get("effective_confidence_floor"),
             "magnitude": result.get("magnitude"),
             "risk_reward": result.get("risk_reward"),

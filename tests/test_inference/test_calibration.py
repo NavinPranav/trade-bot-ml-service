@@ -191,10 +191,14 @@ def test_persistence_roundtrip(tmp_path, monkeypatch):
     assert store_b.is_active()
     assert store_b.apply(70.0) == pytest.approx(cal_a, abs=1e-6)
 
-    # Persisted file is human-readable JSON.
+    # Persisted file is human-readable JSON. Phase 4.5 changed the on-disk
+    # schema to a list of per-key maps (version 2); the legacy v1 ``bins`` key
+    # is no longer at the top level.
     persisted = json.loads(Path(tmp_path, "calibration_state.json").read_text())
     assert persisted["meta"]["active"] is True
-    assert len(persisted["bins"]) >= 1
+    assert int(persisted.get("version", 1)) >= 2
+    assert isinstance(persisted["maps"], list) and len(persisted["maps"]) >= 1
+    assert len(persisted["maps"][0]["bins"]) >= 1
 
 
 def test_status_payload_shape(monkeypatch):

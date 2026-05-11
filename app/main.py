@@ -95,6 +95,14 @@ class ModelUpdateRequest(BaseModel):
 class ChecklistWeightRequest(BaseModel):
     weight: int = Field(ge=0, le=100, description="Checklist signal weight as a percentage (0–100)")
 
+class ParameterTogglesRequest(BaseModel):
+    """Phase 4.4 — replace the in-memory map of optional parameter toggles.
+
+    Pushed by the Java backend on startup and after every admin change. Unknown
+    keys are silently ignored by the store; required keys are forced back to True.
+    """
+    toggles: Dict[str, bool] = Field(default_factory=dict)
+
 
 class PredictionRecord(BaseModel):
     id: Optional[int] = None
@@ -277,6 +285,29 @@ async def set_checklist_weight(req: ChecklistWeightRequest):
     return {"status": "ok", "weight": req.weight, "remaining": 100 - req.weight}
 
 
+# ── Parameter toggles (Phase 4.4) ─────────────────────────────────────
+# Source of truth is the Java backend's ai_parameter_settings table; this
+# endpoint is the receiver that AiParameterService pings on startup and after
+# every admin change. Stored as an in-memory map; required keys are forced ON
+# inside the store so a stale push cannot disable a guardrail input.
+
+@app.get("/admin/parameters")
+async def get_parameter_toggles():
+    from app.inference.gemini_predictor import _ParameterTogglesStore
+    return {
+        "toggles": _ParameterTogglesStore.to_dict(),
+        "required": sorted(_ParameterTogglesStore._REQUIRED),
+    }
+
+
+@app.put("/admin/parameters")
+async def put_parameter_toggles(req: ParameterTogglesRequest):
+    from app.inference.gemini_predictor import _ParameterTogglesStore
+    updated = _ParameterTogglesStore.update_many(req.toggles or {})
+    logger.info("Admin parameter toggles updated: {}", updated)
+    return {"status": "ok", "toggles": updated}
+
+
 def _normalize_prediction_policy_body(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Accept camelCase (UI) or snake_case keys; strip metadata fields."""
     from app.inference.gemini_predictor import _PredictionPolicyStore as P
@@ -408,8 +439,18 @@ async def delete_prediction_policy():
 
 
 class CalibrationSamplePayload(BaseModel):
+    """One resolved-prediction sample fed into the calibration fitter.
+
+    ``direction`` and ``horizon`` are optional but strongly recommended in
+    Phase 4.5: when supplied they let the store fit per-(direction, horizon)
+    calibration maps. Samples that omit them only contribute to the global
+    ``("*", "*")`` map (Phase 4.3 behaviour, fully back-compat).
+    """
+
     confidence: float = Field(..., ge=0.0, le=100.0)
     win: bool
+    direction: Optional[str] = None
+    horizon: Optional[str] = None
 
 
 class CalibrationRefitRequest(BaseModel):
@@ -468,7 +509,16 @@ def _calibration_pull_from_backend(req: CalibrationRefitRequest) -> List[Calibra
                 win = float(pnl) > 0.0
             else:
                 win = bool(win_field)
-            out.append(CalibrationSamplePayload(confidence=conf, win=win))
+            # Phase 4.5: extract direction/horizon when the backend supplies
+            # them so the fitter can build per-(direction, horizon) maps.
+            direction = s.get("direction")
+            horizon = s.get("horizon")
+            out.append(CalibrationSamplePayload(
+                confidence=conf,
+                win=win,
+                direction=str(direction) if direction is not None else None,
+                horizon=str(horizon) if horizon is not None else None,
+            ))
         except Exception:  # noqa: BLE001
             continue
     return out
@@ -485,15 +535,24 @@ async def refit_calibration(req: CalibrationRefitRequest):
         )
 
     payload_samples = req.samples or _calibration_pull_from_backend(req)
+    # Phase 4.5: forward direction + horizon so the store can split the fit
+    # into per-(direction, horizon) maps. Omit-safe — when both are absent the
+    # sample lands only in the global ``("*", "*")`` bucket (Phase 4.3 path).
     samples = [
-        CalibrationSample(confidence=float(s.confidence), win=bool(s.win))
+        CalibrationSample(
+            confidence=float(s.confidence),
+            win=bool(s.win),
+            direction=s.direction,
+            horizon=s.horizon,
+        )
         for s in payload_samples
     ]
     store = get_calibration_store()
     result = store.fit(samples, horizon_filter=req.horizon)
     if result.get("active"):
         logger.info(
-            "Calibration refit succeeded: n={} bins={}", result.get("n_samples"), result.get("n_bins")
+            "Calibration refit succeeded: n={} maps={} bins={}",
+            result.get("n_samples"), result.get("n_maps"), result.get("n_bins"),
         )
     else:
         logger.info("Calibration refit deferred: {}", result)
