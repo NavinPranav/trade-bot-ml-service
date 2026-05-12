@@ -1,8 +1,8 @@
 """Map gRPC market messages to pandas frames (bars supplied by the upstream backend).
 
 The Java/backend service streams market data (e.g. from its broker integration). This service
-never calls broker APIs directly. OHLCV may be daily or multiple intraday bars per session; we
-aggregate to one row per calendar day in the configured market timezone for indicator features.
+never calls broker APIs directly. By default bars are returned with their original intraday
+resolution; pass ``aggregate_daily=True`` only for the classical ML pipeline.
 """
 from __future__ import annotations
 
@@ -45,10 +45,15 @@ def _attr_or_key(obj, name):
     return getattr(obj, name)
 
 
-def ohlcv_bars_to_dataframe(bars) -> pd.DataFrame:
-    """Convert repeated OhlcvBar to a daily OHLCV frame (intraday bars aggregated per day).
+def ohlcv_bars_to_dataframe(bars, *, aggregate_daily: bool = False) -> pd.DataFrame:
+    """Convert repeated OhlcvBar to an OHLCV DataFrame.
 
     Accepts proto OhlcvBar objects or plain dicts with the same keys.
+
+    When ``aggregate_daily=False`` (default) bars are returned at their original intraday
+    resolution, which is required for AI/Gemini predictions and for computing technical
+    indicators over many intraday bars.  Pass ``aggregate_daily=True`` to collapse intraday
+    bars to one row per calendar day (used by the classical ML pipeline).
     """
     if not bars:
         return pd.DataFrame()
@@ -69,6 +74,8 @@ def ohlcv_bars_to_dataframe(bars) -> pd.DataFrame:
     if df.index.duplicated().any():
         logger.warning("Duplicate OHLCV timestamps in gRPC payload; keeping last row per timestamp")
         df = df[~df.index.duplicated(keep="last")]
+    if not aggregate_daily:
+        return df
     out = _daily_ohlcv_from_intraday(df)
     if out.index.duplicated().any():
         logger.warning("Duplicate daily OHLCV rows after aggregation; keeping last")

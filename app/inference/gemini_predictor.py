@@ -144,6 +144,18 @@ def _ohlcv_quality_diagnostic(
                         f"mixed_bar_intervals modal={most_common}s "
                         f"non_modal_bars={non_modal}/{len(intra_session)}"
                     )
+                # Warn when the bar interval doesn't match the horizon (e.g. daily bars for 5M prediction).
+                _EXPECTED_BAR_SECONDS: dict[str, int] = {
+                    "5M": 300, "15M": 900, "30M": 1800, "1H": 3600,
+                }
+                if most_common is not None:
+                    expected_interval = _EXPECTED_BAR_SECONDS.get((horizon or "").upper())
+                    if expected_interval and most_common >= expected_interval * 20:
+                        out["warnings"].append(
+                            f"bar_resolution_mismatch: {horizon} expects ~{expected_interval}s bars "
+                            f"but modal interval is {most_common}s "
+                            "(backend is likely sending daily candles for an intraday prediction)"
+                        )
     except Exception:
         pass
 

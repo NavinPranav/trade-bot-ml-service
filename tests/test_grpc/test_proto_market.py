@@ -69,7 +69,7 @@ def test_intraday_ohlcv_aggregates_to_single_daily_row():
             volume=2_000,
         ),
     ]
-    df = ohlcv_bars_to_dataframe(bars)
+    df = ohlcv_bars_to_dataframe(bars, aggregate_daily=True)
     assert len(df) == 1
     assert df["open"].iloc[0] == 100.0
     assert df["high"].iloc[0] == 105.0

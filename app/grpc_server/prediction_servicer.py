@@ -116,18 +116,18 @@ class PredictionServicer:
                 )
                 return self._build_response(pb2, buf.get_baseline_horizon(), cached_live)
 
-        min_bars = _grpc_min_bars_for_horizon(request.horizon)
-        if len(request.sensex_ohlcv) < min_bars:
-            await context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT,
-                f"sensex_ohlcv must contain at least {min_bars} bars for horizon={request.horizon} "
-                "(per-horizon floor; configure min_ohlcv_bars_by_horizon if needed)",
-            )
-        ohlcv = ohlcv_bars_to_dataframe(request.sensex_ohlcv)
+        ohlcv = ohlcv_bars_to_dataframe(request.sensex_ohlcv, aggregate_daily=(engine == "ML"))
         if ohlcv.empty:
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "sensex_ohlcv did not parse to a non-empty dataframe (check timestamps/types)",
+            )
+        min_bars = _grpc_min_bars_for_horizon(request.horizon)
+        if len(ohlcv) < min_bars:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"sensex_ohlcv must contain at least {min_bars} bars for horizon={request.horizon} "
+                "(per-horizon floor; configure min_ohlcv_bars_by_horizon if needed)",
             )
 
         if len(request.india_vix) >= 1:
@@ -193,18 +193,18 @@ class PredictionServicer:
         if self.predictor is None:
             await context.abort(grpc.StatusCode.UNIMPLEMENTED, _ML_UNAVAILABLE_MSG)
 
-        min_bars = _grpc_min_bars_for_horizon(request.horizon)
-        if len(request.sensex_ohlcv) < min_bars:
-            await context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT,
-                f"sensex_ohlcv must contain at least {min_bars} bars for horizon={request.horizon}",
-            )
-
-        ohlcv = ohlcv_bars_to_dataframe(request.sensex_ohlcv)
+        ohlcv = ohlcv_bars_to_dataframe(request.sensex_ohlcv, aggregate_daily=True)
         if ohlcv.empty:
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "Failed to parse sensex_ohlcv",
+            )
+
+        min_bars = _grpc_min_bars_for_horizon(request.horizon)
+        if len(ohlcv) < min_bars:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"sensex_ohlcv must contain at least {min_bars} bars for horizon={request.horizon}",
             )
 
         try:

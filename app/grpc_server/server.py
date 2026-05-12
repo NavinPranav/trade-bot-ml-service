@@ -19,8 +19,8 @@ async def serve_grpc(port: int | None = None):
         prediction_service_pb2_grpc.add_PredictionServiceServicer_to_server(
             PredictionServicer(), server
         )
-    except ImportError:
-        logger.warning("gRPC stubs not generated yet. Run: make proto")
+    except (ImportError, RuntimeError) as e:
+        logger.warning(f"gRPC stubs error ({type(e).__name__}): {e}. Run: make proto")
         set_grpc_listen("", False)
         return
 

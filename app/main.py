@@ -738,22 +738,24 @@ async def predict(req: PredictRequest):
     from app.grpc_server.live_tick_buffer import get_live_tick_buffer
     from app.inference.gemini_predictor import GeminiPredictor
 
+    use_ai = req.engine.upper() == "AI"
+
+    bars_as_dicts = [b.model_dump() for b in req.sensex_ohlcv]
+    ohlcv = ohlcv_bars_to_dataframe(bars_as_dicts, aggregate_daily=not use_ai)
+    if ohlcv.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="sensex_ohlcv did not parse to a non-empty dataframe (check timestamps/types)",
+        )
+
     min_bars = _min_bars_for_horizon(req.horizon)
-    if len(req.sensex_ohlcv) < min_bars:
+    if len(ohlcv) < min_bars:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"sensex_ohlcv must contain at least {min_bars} bars for horizon={req.horizon} "
                 "(per-horizon floor; configure min_ohlcv_bars_by_horizon if needed)"
             ),
-        )
-
-    bars_as_dicts = [b.model_dump() for b in req.sensex_ohlcv]
-    ohlcv = ohlcv_bars_to_dataframe(bars_as_dicts)
-    if ohlcv.empty:
-        raise HTTPException(
-            status_code=400,
-            detail="sensex_ohlcv did not parse to a non-empty dataframe (check timestamps/types)",
         )
 
     if req.india_vix:
@@ -767,8 +769,6 @@ async def predict(req: PredictRequest):
     quote: Optional[Dict[str, Any]] = None
     if req.sensex_quote and req.sensex_quote.price > 0:
         quote = req.sensex_quote.model_dump()
-
-    use_ai = req.engine.upper() == "AI"
     sym = req.underlying_symbol or ""
 
     try:
@@ -833,6 +833,23 @@ async def predict(req: PredictRequest):
     except Exception as e:
         logger.exception(f"REST /predict failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── gRPC catch-all (Java mistakenly hitting HTTP port with gRPC paths) ────
+
+@app.api_route(
+    "/sensex.ml.{grpc_path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+async def grpc_not_on_http_port(grpc_path: str):
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            f"gRPC method /sensex.ml.{grpc_path} cannot be called over HTTP/1.1. "
+            f"Connect to the gRPC port ({GRPC_PORT}) using a gRPC client."
+        ),
+    )
 
 
 # ── gRPC + Uvicorn startup ─────────────────────────────────────────────
