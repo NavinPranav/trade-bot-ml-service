@@ -7,7 +7,7 @@ import grpc
 from loguru import logger
 
 from app.config import settings
-from app.grpc_server.proto_market import ohlcv_bars_to_dataframe, vix_points_to_dataframe
+from app.grpc_server.proto_market import ohlcv_bars_to_dataframe, options_chain_to_dataframe, vix_points_to_dataframe
 from app.grpc_server.live_tick_buffer import get_live_tick_buffer, live_tick_routing_key
 from app.inference.gemini_predictor import GeminiPredictor
 
@@ -140,6 +140,9 @@ class PredictionServicer:
             from app.data.ingestion.vix_fetcher import derive_vix_from_ohlcv
             vix = derive_vix_from_ohlcv(ohlcv)
 
+        # Parse options chain (empty DataFrame when not provided — prompt shows N/A)
+        options_chain = options_chain_to_dataframe(request.options_chain)
+
         quote = None
         sq = request.sensex_quote
         if sq.ByteSize() > 0:
@@ -154,7 +157,7 @@ class PredictionServicer:
             rpc_name = "GetGeminiPrediction" if engine == "AI" else "GetPrediction"
             logger.info(
                 f"{rpc_name}: horizon={request.horizon} bars={len(ohlcv)} "
-                f"vix={len(vix)} underlying={sym!r}"
+                f"vix={len(vix)} underlying={sym!r} optionStrikes={len(options_chain)}"
             )
 
             if engine == "AI":
@@ -164,6 +167,7 @@ class PredictionServicer:
                     vix=vix,
                     sensex_quote=quote,
                     underlying_symbol=sym,
+                    options_chain=options_chain if not options_chain.empty else None,
                 )
             else:
                 result = self.predictor.predict(
@@ -180,6 +184,7 @@ class PredictionServicer:
                 engine=engine,
                 underlying_symbol=request.underlying_symbol or "",
                 instrument_token=request.instrument_token or "",
+                options_chain=options_chain if not options_chain.empty else None,
             )
 
             return self._build_response(pb2, request.horizon, result)
@@ -348,6 +353,7 @@ class PredictionServicer:
         engine = buf.get_baseline_engine()
         vix = buf.get_baseline_vix()
         baseline_sym = buf.get_baseline_underlying()
+        options_chain = buf.get_baseline_options_chain()
 
         tick = buf.get_baseline_tick()
         quote = None
@@ -359,7 +365,8 @@ class PredictionServicer:
             label = "GEMINI" if use_gemini else "ML"
             logger.info(
                 f"[LIVE RE-PREDICT {label}] horizon={horizon} merged_bars={len(merged)} "
-                f"underlying={baseline_sym!r} ltp={tick.ltp if tick else 'N/A'}"
+                f"underlying={baseline_sym!r} ltp={tick.ltp if tick else 'N/A'} "
+                f"optionStrikes={len(options_chain) if options_chain is not None else 0}"
             )
             if use_gemini:
                 result = self.gemini_predictor.predict(
@@ -368,6 +375,7 @@ class PredictionServicer:
                     vix=vix,
                     sensex_quote=quote,
                     underlying_symbol=baseline_sym,
+                    options_chain=options_chain if options_chain is not None and not options_chain.empty else None,
                 )
             else:
                 result = self.predictor.predict(

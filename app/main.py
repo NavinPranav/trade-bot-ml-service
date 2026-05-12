@@ -56,6 +56,17 @@ class SensexQuoteRest(BaseModel):
     change: float = 0.0
     change_pct: float = 0.0
 
+class OptionsStrikeRest(BaseModel):
+    strike: float
+    call_oi: int = 0
+    put_oi: int = 0
+    call_volume: int = 0
+    put_volume: int = 0
+    call_iv: float = 0.0
+    put_iv: float = 0.0
+    call_ltp: float = 0.0
+    put_ltp: float = 0.0
+
 class PredictRequest(BaseModel):
     horizon: str = "1D"
     sensex_ohlcv: List[OhlcvBarRest]
@@ -64,6 +75,7 @@ class PredictRequest(BaseModel):
     underlying_symbol: str = ""
     instrument_token: str = ""
     engine: str = Field(default="AI", description="AI (Gemini) or ML (classical ensemble)")
+    options_chain: List[OptionsStrikeRest] = Field(default_factory=list)
 
 class PredictResponse(BaseModel):
     prediction_date: str
@@ -771,9 +783,18 @@ async def predict(req: PredictRequest):
         quote = req.sensex_quote.model_dump()
     sym = req.underlying_symbol or ""
 
+    # Build options chain DataFrame from REST payload (empty when not provided)
+    options_chain_df = None
+    if req.options_chain:
+        import pandas as pd
+        options_chain_df = pd.DataFrame([s.model_dump() for s in req.options_chain])
+
     try:
         if use_ai:
-            logger.info(f"REST /predict (AI): horizon={req.horizon} bars={len(ohlcv)} vix={len(vix)} underlying={sym!r}")
+            logger.info(
+                f"REST /predict (AI): horizon={req.horizon} bars={len(ohlcv)} vix={len(vix)} "
+                f"underlying={sym!r} optionStrikes={len(req.options_chain)}"
+            )
             predictor = GeminiPredictor()
             result = predictor.predict(
                 horizon=req.horizon,
@@ -781,6 +802,7 @@ async def predict(req: PredictRequest):
                 vix=vix,
                 sensex_quote=quote,
                 underlying_symbol=sym,
+                options_chain=options_chain_df if options_chain_df is not None and not options_chain_df.empty else None,
             )
         else:
             logger.info(f"REST /predict (ML): horizon={req.horizon} bars={len(ohlcv)} vix={len(vix)}")

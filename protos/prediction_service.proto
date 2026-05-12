@@ -46,6 +46,27 @@ message SensexQuote {
   double change_pct = 3;
 }
 
+// One strike level in the options chain (CE + PE data combined for efficiency).
+message OptionsStrike {
+  double strike = 1;
+  int64 call_oi = 2;
+  int64 put_oi = 3;
+  int64 call_volume = 4;
+  int64 put_volume = 5;
+  double call_iv = 6;
+  double put_iv = 7;
+  double call_ltp = 8;
+  double put_ltp = 9;
+}
+
+// Snapshot of the nearest-expiry options chain at the time of the prediction request.
+// Strikes are sorted ascending. Empty when the backend has no options data (prompt renders N/A).
+message OptionsChainSummary {
+  repeated OptionsStrike strikes = 1;
+  string expiry = 2;          // ISO date of the options expiry, e.g. "2025-01-16"
+  string snapshot_time = 3;   // ISO datetime the snapshot was taken (informational)
+}
+
 message PredictionRequest {
   string horizon = 1;
   // Historical daily bars for underlying_symbol (name is legacy; not limited to Sensex).
@@ -58,6 +79,8 @@ message PredictionRequest {
   string underlying_symbol = 5;
   // Angel One instrument token (string, e.g. "26009") — send same value as LiveTick.token to match stream ticks.
   string instrument_token = 6;
+  // Nearest-expiry options chain snapshot. Empty when unavailable (prompt shows N/A for options fields).
+  OptionsChainSummary options_chain = 7;
 }
 
 message PredictionResponse {

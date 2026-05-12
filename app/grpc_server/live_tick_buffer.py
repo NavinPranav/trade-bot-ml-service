@@ -67,6 +67,7 @@ class LiveTickBuffer:
         self._ticks: Dict[str, TickSnapshot] = {}
         self._baseline_ohlcv: Optional[pd.DataFrame] = None
         self._baseline_vix: Optional[pd.DataFrame] = None
+        self._baseline_options_chain: Optional[pd.DataFrame] = None
         self._baseline_horizon: str = ""
         self._baseline_engine: str = "ML"
         self._baseline_underlying: str = ""
@@ -129,6 +130,10 @@ class LiveTickBuffer:
         with self._lock:
             return self._ticks.get((symbol or "").strip().upper())
 
+    def get_baseline_options_chain(self) -> Optional[pd.DataFrame]:
+        with self._lock:
+            return self._baseline_options_chain
+
     def store_baseline(
         self,
         horizon: str,
@@ -137,6 +142,7 @@ class LiveTickBuffer:
         engine: str = "ML",
         underlying_symbol: str = "",
         instrument_token: str = "",
+        options_chain: Optional[pd.DataFrame] = None,
     ) -> None:
         """
         Called from GetPrediction/GetGeminiPrediction to snapshot historical data for live merging.
@@ -166,6 +172,7 @@ class LiveTickBuffer:
 
             self._baseline_ohlcv = ohlcv.copy() if ohlcv is not None else None
             self._baseline_vix = vix.copy() if vix is not None else None
+            self._baseline_options_chain = options_chain.copy() if options_chain is not None else None
             self._baseline_horizon = horizon
             self._baseline_engine = engine
             self._baseline_underlying = (underlying_symbol or "").strip()
@@ -175,7 +182,8 @@ class LiveTickBuffer:
                 f"Baseline stored: engine={engine} horizon={horizon} "
                 f"underlying={self._baseline_underlying!r} token={self._baseline_instrument_token!r} "
                 f"bars={bars} "
-                f"vix={'yes' if vix is not None and not vix.empty else 'no'}"
+                f"vix={'yes' if vix is not None and not vix.empty else 'no'} "
+                f"optionStrikes={len(options_chain) if options_chain is not None else 0}"
             )
 
     def tick_matches_baseline(self, route_key: str) -> bool:

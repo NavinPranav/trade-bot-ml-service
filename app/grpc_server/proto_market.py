@@ -83,6 +83,37 @@ def ohlcv_bars_to_dataframe(bars, *, aggregate_daily: bool = False) -> pd.DataFr
     return out
 
 
+def options_chain_to_dataframe(options_chain_summary) -> pd.DataFrame:
+    """Convert an OptionsChainSummary proto (or None) to a DataFrame.
+
+    Columns: strike, call_oi, put_oi, call_volume, put_volume,
+             call_iv, put_iv, call_ltp, put_ltp.
+    Returns an empty DataFrame when no strike data is present.
+    """
+    if options_chain_summary is None:
+        return pd.DataFrame()
+    strikes = getattr(options_chain_summary, "strikes", None)
+    if not strikes:
+        return pd.DataFrame()
+    rows = []
+    for s in strikes:
+        rows.append({
+            "strike":       float(_attr_or_key(s, "strike")),
+            "call_oi":      int(_attr_or_key(s, "call_oi")),
+            "put_oi":       int(_attr_or_key(s, "put_oi")),
+            "call_volume":  int(_attr_or_key(s, "call_volume")),
+            "put_volume":   int(_attr_or_key(s, "put_volume")),
+            "call_iv":      float(_attr_or_key(s, "call_iv")),
+            "put_iv":       float(_attr_or_key(s, "put_iv")),
+            "call_ltp":     float(_attr_or_key(s, "call_ltp")),
+            "put_ltp":      float(_attr_or_key(s, "put_ltp")),
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
+    return df
+
+
 def vix_points_to_dataframe(points) -> pd.DataFrame:
     """Accepts proto VixPoint objects or plain dicts with the same keys."""
     if not points:

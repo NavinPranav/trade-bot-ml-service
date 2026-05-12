@@ -1401,6 +1401,78 @@ def _fmt(v: Any, decimals: int = 2) -> str:
         return str(v)
 
 
+def _compute_options_summary(options_chain: pd.DataFrame, spot: float) -> dict:
+    """Compute PCR, max pain, OI walls and ATM Greeks from the options chain DataFrame.
+
+    The DataFrame must have columns: strike, call_oi, put_oi, call_volume, put_volume,
+    call_iv, put_iv, call_ltp, put_ltp (as produced by options_chain_to_dataframe).
+    """
+    from app.features.options_features import compute_pcr, compute_max_pain
+
+    if options_chain is None or options_chain.empty:
+        return {}
+
+    try:
+        # Convert pivot-style DataFrame to long format expected by compute_pcr / compute_max_pain
+        calls = options_chain[["strike", "call_oi", "call_volume", "call_iv", "call_ltp"]].copy()
+        calls.columns = ["strike", "oi", "volume", "iv", "ltp"]
+        calls["option_type"] = "CALL"
+
+        puts = options_chain[["strike", "put_oi", "put_volume", "put_iv", "put_ltp"]].copy()
+        puts.columns = ["strike", "oi", "volume", "iv", "ltp"]
+        puts["option_type"] = "PUT"
+
+        chain = pd.concat([calls, puts], ignore_index=True)
+
+        pcr = compute_pcr(chain)
+        max_pain = compute_max_pain(chain)
+
+        # Highest OI strikes = call wall (resistance) and put wall (support)
+        call_oi_by_strike = options_chain.groupby("strike")["call_oi"].sum()
+        put_oi_by_strike = options_chain.groupby("strike")["put_oi"].sum()
+
+        highest_call_oi_strike = float(call_oi_by_strike.idxmax()) if not call_oi_by_strike.empty else 0.0
+        highest_call_oi = int(call_oi_by_strike.max()) if not call_oi_by_strike.empty else 0
+        highest_put_oi_strike = float(put_oi_by_strike.idxmax()) if not put_oi_by_strike.empty else 0.0
+        highest_put_oi = int(put_oi_by_strike.max()) if not put_oi_by_strike.empty else 0
+
+        # ATM strike = nearest to spot
+        strikes = sorted(options_chain["strike"].unique())
+        atm_strike = min(strikes, key=lambda x: abs(x - spot)) if strikes and spot > 0 else 0.0
+
+        atm_row = options_chain[options_chain["strike"] == atm_strike]
+        atm_call_iv = float(atm_row["call_iv"].iloc[0]) if not atm_row.empty else 0.0
+        atm_put_iv = float(atm_row["put_iv"].iloc[0]) if not atm_row.empty else 0.0
+        atm_call_ltp = float(atm_row["call_ltp"].iloc[0]) if not atm_row.empty else 0.0
+        atm_put_ltp = float(atm_row["put_ltp"].iloc[0]) if not atm_row.empty else 0.0
+
+        iv_skew = round(atm_put_iv - atm_call_iv, 2)
+        max_pain_distance = round(float(max_pain) - spot, 2) if max_pain and spot else 0.0
+        max_pain_distance_pct = round(max_pain_distance / spot * 100, 2) if spot else 0.0
+
+        return {
+            **pcr,
+            "max_pain": max_pain,
+            "max_pain_distance": max_pain_distance,
+            "max_pain_distance_pct": max_pain_distance_pct,
+            "highest_call_oi_strike": highest_call_oi_strike,
+            "highest_call_oi": highest_call_oi,
+            "highest_put_oi_strike": highest_put_oi_strike,
+            "highest_put_oi": highest_put_oi,
+            "call_wall": highest_call_oi_strike,
+            "put_wall": highest_put_oi_strike,
+            "iv_call": atm_call_iv,
+            "iv_put": atm_put_iv,
+            "iv_skew": iv_skew,
+            "atm_ce_premium": atm_call_ltp,
+            "atm_pe_premium": atm_put_ltp,
+            "atm_strike": atm_strike,
+        }
+    except Exception as e:
+        logger.warning("Options summary computation failed: {}", e)
+        return {}
+
+
 def _build_snapshot_context(
     ohlcv: pd.DataFrame,
     vix: pd.DataFrame,
@@ -1409,6 +1481,7 @@ def _build_snapshot_context(
     realtime: dict[str, Any],
     target_minutes: int,
     trend_context: dict[str, Any] | None = None,
+    options_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute all named substitution values for the system prompt template.
 
@@ -1644,6 +1717,9 @@ def _build_snapshot_context(
         )
     last_5_candles = "\n".join(lines) if lines else "  (insufficient data)"
 
+    # ── Options flow ─────────────────────────────────────────────────────────
+    ops = options_summary or {}
+
     return {
         # Price
         "spot_price":    _fmt(spot),
@@ -1695,6 +1771,23 @@ def _build_snapshot_context(
         "resistance_dist":    _fmt(resistance_dist) if isinstance(resistance_dist, (int, float)) else resistance_dist,
         "support_nearest":    support_nearest,
         "support_dist":       _fmt(support_dist) if isinstance(support_dist, (int, float)) else support_dist,
+        # Options flow
+        "pcr_oi":                _fmt(ops.get("pcr_oi"), 2),
+        "pcr_volume":            _fmt(ops.get("pcr_volume"), 2),
+        "max_pain":              _fmt(ops.get("max_pain")),
+        "max_pain_distance":     _fmt(ops.get("max_pain_distance")),
+        "max_pain_distance_pct": _fmt(ops.get("max_pain_distance_pct"), 2),
+        "highest_call_oi_strike": _fmt(ops.get("highest_call_oi_strike")),
+        "highest_call_oi":       _fmt(ops.get("highest_call_oi")),
+        "highest_put_oi_strike": _fmt(ops.get("highest_put_oi_strike")),
+        "highest_put_oi":        _fmt(ops.get("highest_put_oi")),
+        "call_wall":             _fmt(ops.get("call_wall")),
+        "put_wall":              _fmt(ops.get("put_wall")),
+        "iv_call":               _fmt(ops.get("iv_call"), 1),
+        "iv_put":                _fmt(ops.get("iv_put"), 1),
+        "iv_skew":               _fmt(ops.get("iv_skew"), 2),
+        "atm_ce_premium":        _fmt(ops.get("atm_ce_premium")),
+        "atm_pe_premium":        _fmt(ops.get("atm_pe_premium")),
         # Calendar
         "market_phase":  market_phase,
         "time_ist":      now_ist.strftime("%H:%M IST"),
@@ -2230,6 +2323,7 @@ class GeminiPredictor:
         vix: Optional[pd.DataFrame] = None,
         sensex_quote: Optional[Dict[str, Any]] = None,
         underlying_symbol: str = "",
+        options_chain: Optional[pd.DataFrame] = None,
     ) -> Dict[str, Any]:
         pid = _make_pid()
         log_pfx = f"[pid={pid}]"
@@ -2373,9 +2467,27 @@ class GeminiPredictor:
             "enabled": _ParameterTogglesStore.is_enabled("news_sentiment"),
         })
 
+        # Compute options flow summary (non-fatal — empty dict when chain unavailable)
+        spot_price = float(realtime.get("price") or 0)
+        options_summary = {}
+        if options_chain is not None and not options_chain.empty:
+            try:
+                options_summary = _compute_options_summary(options_chain, spot_price)
+                _log_marker("PRED_OPTIONS", pid, {
+                    "pcr_oi": options_summary.get("pcr_oi"),
+                    "pcr_volume": options_summary.get("pcr_volume"),
+                    "max_pain": options_summary.get("max_pain"),
+                    "call_wall": options_summary.get("call_wall"),
+                    "put_wall": options_summary.get("put_wall"),
+                    "strikes_count": len(options_chain),
+                })
+            except Exception as oe:
+                logger.warning("{} Options summary failed (non-fatal): {}", log_pfx, oe)
+
         snapshot_ctx = _build_snapshot_context(
             ohlcv, vix, indicators, checklist_signal, realtime, target_minutes,
             trend_context=trend_context,
+            options_summary=options_summary,
         )
         # Phase 4.4 — strip placeholder values from the prompt for sections the
         # admin has disabled. The _SafeDict fallback in _SYSTEM_PROMPT_TEMPLATE
@@ -2414,6 +2526,8 @@ class GeminiPredictor:
             user_payload["checklist_signal"] = checklist_signal
         if _ParameterTogglesStore.is_enabled("news_sentiment"):
             user_payload["news_sentiment"] = news_sentiment
+        if options_summary:
+            user_payload["options_flow"] = options_summary
 
         _log_marker("PRED_PARAMS", pid, _ParameterTogglesStore.to_dict())
         user_text = json.dumps(user_payload, default=str)
