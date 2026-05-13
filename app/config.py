@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
 
+    # OpenAI / ChatGPT (used when prediction_engine=OPENAI)
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"
+    openai_base_url: str = "https://api.openai.com/v1"
+
     # Post-coercion policy (tune without code changes — env / .env)
     gemini_min_confidence: float = 65.0
     gemini_min_risk_reward: float = 1.5

@@ -250,34 +250,45 @@ async def reset_prompt():
 
 @app.get("/admin/model")
 async def get_active_model():
-    from app.inference.gemini_predictor import _ModelStore
+    from app.inference.active_model_store import _ActiveModelStore
     from app.config import settings
-    active = _ModelStore.get()
+    tool = _ActiveModelStore.get_tool()
+    model_id = _ActiveModelStore.get_model_id()
+    env_default = settings.openai_model if tool == "OPENAI" else settings.gemini_model
     return {
-        "model_id": active,
-        "is_override": bool(_ModelStore._model_id),
-        "env_default": settings.gemini_model,
+        "tool": tool,
+        "model_id": model_id,
+        "is_override": bool(_ActiveModelStore._model_id),
+        "env_default": env_default,
     }
 
 
 @app.put("/admin/model")
 async def set_active_model(req: ModelUpdateRequest):
+    from app.inference.active_model_store import _ActiveModelStore
     from app.inference.gemini_predictor import _ModelStore
+    tool = (req.tool or "GEMINI").strip().upper()
     model_id = req.model_id.strip()
     if not model_id:
         raise HTTPException(status_code=400, detail="model_id must not be empty")
-    _ModelStore.set(model_id)
-    logger.info("Admin model updated to '{}' (tool={})", model_id, req.tool)
-    return {"status": "ok", "model_id": model_id, "tool": req.tool}
+    # Update centralized routing store
+    _ActiveModelStore.set(tool, model_id)
+    # Keep _ModelStore in sync for Gemini so GeminiPredictor picks up the model
+    if tool == "GEMINI":
+        _ModelStore.set(model_id)
+    logger.info("Admin model updated: tool={} model_id={}", tool, model_id)
+    return {"status": "ok", "tool": tool, "model_id": model_id}
 
 
 @app.delete("/admin/model")
 async def reset_model():
+    from app.inference.active_model_store import _ActiveModelStore
     from app.inference.gemini_predictor import _ModelStore
     from app.config import settings
+    _ActiveModelStore.clear()
     _ModelStore.clear()
-    logger.info("Admin model reset to env default '{}'", settings.gemini_model)
-    return {"status": "ok", "model_id": settings.gemini_model, "message": "Reverted to env default"}
+    logger.info("Admin model reset to env defaults (tool=GEMINI model={})", settings.gemini_model)
+    return {"status": "ok", "tool": "GEMINI", "model_id": settings.gemini_model, "message": "Reverted to env defaults"}
 
 
 # ── Admin checklist weight endpoints ─────────────────────────────────────────
@@ -748,9 +759,13 @@ async def analyse_predictions(req: AnalyseRequest):
 async def predict(req: PredictRequest):
     from app.grpc_server.proto_market import ohlcv_bars_to_dataframe, vix_points_to_dataframe
     from app.grpc_server.live_tick_buffer import get_live_tick_buffer
-    from app.inference.gemini_predictor import GeminiPredictor
+    from app.inference.active_model_store import _ActiveModelStore
 
-    use_ai = req.engine.upper() == "AI"
+    # "AI" is the legacy value from older Java backends — treated as GEMINI.
+    engine_key = req.engine.upper()
+    use_gemini = engine_key in ("AI", "GEMINI")
+    use_openai = engine_key == "OPENAI"
+    use_ai = use_gemini or use_openai   # intraday bar resolution for AI paths
 
     bars_as_dicts = [b.model_dump() for b in req.sensex_ohlcv]
     ohlcv = ohlcv_bars_to_dataframe(bars_as_dicts, aggregate_daily=not use_ai)
@@ -789,21 +804,36 @@ async def predict(req: PredictRequest):
         import pandas as pd
         options_chain_df = pd.DataFrame([s.model_dump() for s in req.options_chain])
 
+    common_kwargs = dict(
+        horizon=req.horizon,
+        ohlcv=ohlcv,
+        vix=vix,
+        sensex_quote=quote,
+        underlying_symbol=sym,
+        options_chain=options_chain_df if options_chain_df is not None and not options_chain_df.empty else None,
+    )
+
     try:
-        if use_ai:
+        if use_openai:
+            from app.inference.openai_predictor import OpenAIPredictor
             logger.info(
-                f"REST /predict (AI): horizon={req.horizon} bars={len(ohlcv)} vix={len(vix)} "
-                f"underlying={sym!r} optionStrikes={len(req.options_chain)}"
+                "REST /predict (OPENAI model={}): horizon={} bars={} vix={} "
+                "underlying={!r} optionStrikes={}",
+                _ActiveModelStore.get_model_id(), req.horizon, len(ohlcv), len(vix),
+                sym, len(req.options_chain),
             )
-            predictor = GeminiPredictor()
-            result = predictor.predict(
-                horizon=req.horizon,
-                ohlcv=ohlcv,
-                vix=vix,
-                sensex_quote=quote,
-                underlying_symbol=sym,
-                options_chain=options_chain_df if options_chain_df is not None and not options_chain_df.empty else None,
+            result = OpenAIPredictor().predict(**common_kwargs)
+
+        elif use_gemini:
+            from app.inference.gemini_predictor import GeminiPredictor
+            logger.info(
+                "REST /predict (GEMINI model={}): horizon={} bars={} vix={} "
+                "underlying={!r} optionStrikes={}",
+                _ActiveModelStore.get_model_id(), req.horizon, len(ohlcv), len(vix),
+                sym, len(req.options_chain),
             )
+            result = GeminiPredictor().predict(**common_kwargs)
+
         else:
             logger.info(f"REST /predict (ML): horizon={req.horizon} bars={len(ohlcv)} vix={len(vix)}")
             try:
@@ -811,14 +841,10 @@ async def predict(req: PredictRequest):
                 if not ML_PIPELINE_ACTIVE:
                     raise HTTPException(
                         status_code=501,
-                        detail="ML prediction pipeline is disabled; use engine=AI or set ML_PIPELINE_ACTIVE=True",
+                        detail="ML prediction pipeline is disabled; use engine=GEMINI or engine=OPENAI",
                     )
-                predictor = Predictor()
-                result = predictor.predict(
-                    horizon=req.horizon,
-                    ohlcv=ohlcv,
-                    vix=vix,
-                    sensex_quote=quote,
+                result = Predictor().predict(
+                    horizon=req.horizon, ohlcv=ohlcv, vix=vix, sensex_quote=quote,
                 )
             except ImportError:
                 raise HTTPException(status_code=501, detail="ML prediction pipeline not available; use engine=AI")
