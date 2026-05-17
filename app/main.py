@@ -365,7 +365,7 @@ def _validate_prediction_policy_patch(p: Dict[str, Any]) -> List[str]:
             errs.append(f"{key} must be between {lo} and {hi}")
 
     _f("min_confidence", 0, 100)
-    _f("min_risk_reward", 0.5, 20)
+    _f("min_risk_reward", 0.0, 20)
     _f("strong_trend_min_ema_gap_pct", 0, 5)
     _f("relaxed_confidence_floor_strong_trend", 0, 100)
     _f("sell_near_support_min_confidence", 0, 100)

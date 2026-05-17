@@ -350,6 +350,40 @@ def _compute_indicator_snapshot(ohlcv: pd.DataFrame) -> dict[str, Any]:
         except Exception:
             pass
 
+        # Stochastic Oscillator %K / %D (14, 3)
+        if n >= 14:
+            try:
+                stoch = ta.momentum.StochasticOscillator(
+                    high, low, close, window=14, smooth_window=3
+                )
+                snap["stoch_k"] = _last(stoch.stoch())
+                snap["stoch_d"] = _last(stoch.stoch_signal())
+            except Exception:
+                pass
+
+        # Williams %R (14)
+        if n >= 14:
+            try:
+                snap["williams_r"] = _last(
+                    ta.momentum.williams_r(high, low, close, lbp=14)
+                )
+            except Exception:
+                pass
+
+        # Historical Volatility — annualised log-return std (no volume needed)
+        try:
+            log_rets = np.log(close / close.shift(1)).dropna()
+            if len(log_rets) >= 10:
+                snap["hvol_10"] = round(
+                    float(log_rets.tail(10).std() * (252 ** 0.5) * 100), 2
+                )
+            if len(log_rets) >= 20:
+                snap["hvol_20"] = round(
+                    float(log_rets.tail(20).std() * (252 ** 0.5) * 100), 2
+                )
+        except Exception:
+            pass
+
     except ImportError:
         logger.warning("ta library not installed — skipping indicator snapshot")
     except Exception as e:
@@ -1741,6 +1775,9 @@ def _build_snapshot_context(
         "ema_slope":     ema_slope,
         # Momentum
         "rsi_14":        _fmt(indicators.get("rsi_14"), 1),
+        "stoch_k":       _fmt(indicators.get("stoch_k"), 1),
+        "stoch_d":       _fmt(indicators.get("stoch_d"), 1),
+        "williams_r":    _fmt(indicators.get("williams_r"), 1),
         "vwap":          _fmt(vwap_value),
         "price_vs_vwap": _fmt(price_vs_vwap, 3) if isinstance(price_vs_vwap, (int, float)) else price_vs_vwap,
         "vwap_distance": _fmt(vwap_distance) if isinstance(vwap_distance, (int, float)) else vwap_distance,
@@ -1754,9 +1791,12 @@ def _build_snapshot_context(
         "bb_position":   bb_position,
         "india_vix":     _fmt(india_vix_val),
         "vix_change":    _fmt(vix_change_val),
+        "hvol_10":       _fmt(indicators.get("hvol_10"), 1),
+        "hvol_20":       _fmt(indicators.get("hvol_20"), 1),
         # Volume
         "volume_current": volume_current,
         "volume_ratio":  _fmt(indicators.get("volume_ratio")),
+        "obv_direction": "N/A",
         # Levels
         "pivot":         _fmt(step5.get("pivot")),
         "support_1":     _fmt(step5.get("s1")),
@@ -1788,6 +1828,17 @@ def _build_snapshot_context(
         "iv_skew":               _fmt(ops.get("iv_skew"), 2),
         "atm_ce_premium":        _fmt(ops.get("atm_ce_premium")),
         "atm_pe_premium":        _fmt(ops.get("atm_pe_premium")),
+        # Options flow snapshot-comparison fields (not yet available — require two snapshots)
+        "pcr_open":              "N/A",
+        "pcr_direction":         "N/A",
+        "max_pain_shift":        "N/A",
+        "prev_max_pain":         "N/A",
+        "call_oi_change":        "N/A",
+        "put_oi_change":         "N/A",
+        "gamma_atm":             "N/A",
+        "theta_per_hour":        "N/A",
+        # Indicators not yet computable from index OHLCV
+        "supertrend_signal":     "N/A",
         # Calendar
         "market_phase":  market_phase,
         "time_ist":      now_ist.strftime("%H:%M IST"),
@@ -2109,27 +2160,79 @@ def _coerce_result(
         gates["low_confidence"] = True
         direction = "HOLD"
 
-    # Trading levels (always derive fallbacks from model_direction so below-threshold rows keep levels)
-    entry_price = _f("entry_price", realtime_price) or realtime_price
-    stop_loss = _f("stop_loss")
-    target_price = _f("target_price")
+    # Trading levels — always anchor entry to current market price so levels
+    # stay meaningful regardless of what absolute value the LLM emits.
+    entry_price = realtime_price
 
-    # Fallback stop/target from magnitude if Gemini didn't provide them
-    if not stop_loss and model_direction not in ("HOLD",):
-        atr_pct = 0.003  # 0.3% fallback stop
-        if model_direction == "BUY":
-            stop_loss = round(entry_price * (1 - atr_pct), 2)
+    # Extract ATR(14) from pre-computed indicators for level validation.
+    atr: Optional[float] = None
+    if indicators:
+        try:
+            _raw_atr = indicators.get("atr_14") or 0
+            _atr_f = float(_raw_atr)
+            if _atr_f > 0:
+                atr = _atr_f
+        except (TypeError, ValueError):
+            pass
+
+    llm_stop = _f("stop_loss")
+    llm_target = _f("target_price")
+
+    if model_direction in ("BUY", "SELL") and atr:
+        is_buy = model_direction == "BUY"
+
+        # ── Stop loss ────────────────────────────────────────────────────────
+        # Accept LLM's SL only when it is on the correct side of entry AND
+        # the distance is within [0.3 × ATR, 3 × ATR] — anything outside
+        # that range is almost certainly a hallucinated or stale level.
+        sl_dist = abs(entry_price - llm_stop) if llm_stop else 0
+        sl_valid = (
+            llm_stop > 0
+            and ((is_buy and llm_stop < entry_price) or (not is_buy and llm_stop > entry_price))
+            and 0.3 * atr <= sl_dist <= 3.0 * atr
+        )
+        if sl_valid:
+            stop_loss = round(llm_stop, 2)
+            logger.debug("{} Using LLM stop_loss={} (dist={:.1f}, atr={:.1f})", log_pfx, stop_loss, sl_dist, atr)
         else:
-            stop_loss = round(entry_price * (1 + atr_pct), 2)
+            stop_loss = round(entry_price - 1.5 * atr if is_buy else entry_price + 1.5 * atr, 2)
+            logger.info("{} ATR stop override → {} (llm_stop={}, atr={:.1f})", log_pfx, stop_loss, llm_stop or 0, atr)
 
-    if not target_price and magnitude:
-        target_price = round(realtime_price * (1 + magnitude / 100), 2)
-    elif not target_price:
-        target_price = realtime_price
+        sl_dist_actual = abs(entry_price - stop_loss)
 
-    # Risk/reward
+        # ── Target price ─────────────────────────────────────────────────────
+        # Accept LLM's TP when it is on the correct side, at least as far as
+        # the stop loss (R:R ≥ ~0.8), and not more than 10× the stop distance
+        # (cap runaway targets that the LLM sometimes hallucinates).
+        tp_dist = abs(entry_price - llm_target) if llm_target else 0
+        tp_valid = (
+            llm_target > 0
+            and ((is_buy and llm_target > entry_price) or (not is_buy and llm_target < entry_price))
+            and sl_dist_actual * 0.8 <= tp_dist <= sl_dist_actual * 10
+        )
+        if tp_valid:
+            target_price = round(llm_target, 2)
+            logger.debug("{} Using LLM target_price={} (dist={:.1f})", log_pfx, target_price, tp_dist)
+        else:
+            target_price = round(entry_price + 2.0 * sl_dist_actual if is_buy else entry_price - 2.0 * sl_dist_actual, 2)
+            logger.info("{} ATR target override → {} (llm_target={}, sl_dist={:.1f})", log_pfx, target_price, llm_target or 0, sl_dist_actual)
+    else:
+        # HOLD or ATR unavailable — keep original fallback logic
+        stop_loss = llm_stop
+        target_price = llm_target
+        if not stop_loss and model_direction not in ("HOLD",):
+            atr_pct = 0.003
+            stop_loss = round(
+                entry_price * (1 - atr_pct) if model_direction == "BUY" else entry_price * (1 + atr_pct), 2
+            )
+        if not target_price and magnitude:
+            target_price = round(realtime_price * (1 + magnitude / 100), 2)
+        elif not target_price:
+            target_price = realtime_price
+
+    # Risk/reward — always recompute from final levels
     risk_reward = _f("risk_reward")
-    if not risk_reward and stop_loss and entry_price and target_price:
+    if stop_loss and entry_price and target_price:
         risk = abs(entry_price - stop_loss)
         reward = abs(target_price - entry_price)
         risk_reward = round(reward / risk, 2) if risk > 0 else 0.0

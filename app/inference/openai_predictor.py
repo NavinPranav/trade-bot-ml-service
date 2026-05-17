@@ -11,8 +11,7 @@ is updated; this predictor picks up the change on the next call.
 Supported model families:
   GPT-4o series  : gpt-4o, gpt-4o-mini
   GPT-4.1 series : gpt-4.1, gpt-4.1-mini, gpt-4.1-nano
-  GPT-4 Turbo    : gpt-4-turbo
-  o-series (reasoning): o1, o1-mini, o3-mini, o4-mini
+  o-series (reasoning): o1, o3-mini, o4-mini
     — temperature is NOT sent for reasoning models (API rejects it)
     — response_format json_object IS supported for o1 / o3-mini / o4-mini
 """
@@ -417,7 +416,25 @@ class OpenAIPredictor:
                     "latency_ms": llm_latency_ms, "outcome": "error",
                     "error_detail": detail[:512],
                 })
-                raise RuntimeError(f"OpenAI HTTP {resp.status_code}: {detail}")
+                notice = (
+                    f"OpenAI HTTP {resp.status_code} — model {model_id!r} rejected. "
+                    "Check the model name in Admin settings and retry."
+                )
+                fb = _coerce_result(
+                    {
+                        "direction": "HOLD", "magnitude": 0.0, "confidence": 0.0,
+                        "predicted_volatility": 0.0, "valid_minutes": target_minutes,
+                        "ai_quota_notice": notice,
+                        "reason": f"OpenAI HTTP {resp.status_code} error — HOLD placeholder.",
+                    },
+                    float(realtime["price"]),
+                    indicators=indicators, trend_context=trend_context, ohlcv=ohlcv,
+                    pid=pid, horizon=horizon,
+                )
+                self._log_pred_result(pid, horizon, sym, target_minutes, model_id, fb,
+                                      llm_latency_ms, llm_attempts, status=resp.status_code,
+                                      fallback="error")
+                return fb
 
             data = resp.json()
 
