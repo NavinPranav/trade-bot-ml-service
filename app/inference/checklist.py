@@ -100,13 +100,23 @@ def run_checklist(ohlcv: pd.DataFrame) -> Dict[str, Any]:
         tp = (today_df["high"].astype(float)
               + today_df["low"].astype(float)
               + today_df["close"].astype(float)) / 3
-        vol = today_df["volume"].astype(float).replace(0, 1)
+        raw_vol = today_df["volume"].astype(float)
+        volume_available = raw_vol.sum() > 0
+        vol = raw_vol if volume_available else raw_vol.replace(0, 1)
         vwap = float((tp * vol).sum() / vol.sum())
         cp = float(today_df["close"].iloc[-1])
         diff_pct = abs(cp - vwap) / vwap if vwap else 0
-        sig = "AVOID" if diff_pct <= 0.0005 else ("BULLISH" if cp > vwap else "BEARISH")
+        # When price is far from VWAP (>0.5%), VWAP is not an immediate support/resistance —
+        # label AVOID so the model does not treat a distant VWAP as holding support.
+        if diff_pct > 0.005:
+            sig = "FAR_FROM_VWAP"
+        elif diff_pct <= 0.0005:
+            sig = "AVOID"
+        else:
+            sig = "BULLISH" if cp > vwap else "BEARISH"
         step2 = {"signal": sig, "vwap": round(vwap, 2),
-                 "current_price": cp, "diff_pct": round(diff_pct * 100, 3)}
+                 "current_price": cp, "diff_pct": round(diff_pct * 100, 3),
+                 "volume_weighted": volume_available}
 
     # ── Step 3: MOMENTUM RSI(14) ───────────────────────────────────────
     rsi_val = _rsi(closes)
@@ -211,12 +221,14 @@ def run_checklist(ohlcv: pd.DataFrame) -> Dict[str, Any]:
                step6.get("signal") == "BEARISH_CANDLE"])
     conflict = min(b_c, s_c) >= 2
 
-    no_trade = (step2.get("signal") == "AVOID" or step3.get("signal") == "SIDEWAYS"
+    vwap_sig = step2.get("signal")
+    no_trade = (vwap_sig == "AVOID" or step3.get("signal") == "SIDEWAYS"
                 or low_vol or conflict or too_early or too_late)
     step9 = {
         "signal": "NO_TRADE" if no_trade else "GO",
         "reasons": {
-            "vwap_avoid":         step2.get("signal") == "AVOID",
+            "vwap_avoid":         vwap_sig == "AVOID",
+            "vwap_far":           vwap_sig == "FAR_FROM_VWAP",
             "rsi_sideways":       step3.get("signal") == "SIDEWAYS",
             "low_volume":         low_vol,
             "conflicting_signals": conflict,

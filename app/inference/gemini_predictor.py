@@ -281,6 +281,57 @@ def _vix_tail_summary(vix: pd.DataFrame, max_rows: int = 5) -> list[dict[str, An
     return out
 
 
+def _compute_supertrend(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    period: int = 14, multiplier: float = 3.0,
+) -> tuple[str, float]:
+    """Return (signal, band_value) where signal is 'BUY' or 'SELL'.
+
+    Pure numpy — no external dependencies.  Returns ('N/A', 0.0) on failure.
+    """
+    n = len(close)
+    if n < period + 1:
+        return ("N/A", 0.0)
+    try:
+        h = high.to_numpy(dtype=float)
+        lo = low.to_numpy(dtype=float)
+        c = close.to_numpy(dtype=float)
+        prev_c = np.concatenate([[c[0]], c[:-1]])
+        tr = np.maximum(h - lo, np.maximum(np.abs(h - prev_c), np.abs(lo - prev_c)))
+        # Wilder smoothed ATR
+        atr = np.zeros(n, dtype=float)
+        atr[period - 1] = tr[:period].mean()
+        alpha = 1.0 / period
+        for i in range(period, n):
+            atr[i] = atr[i - 1] * (1.0 - alpha) + tr[i] * alpha
+        hl2 = (h + lo) / 2.0
+        upper = hl2 + multiplier * atr
+        lower = hl2 - multiplier * atr
+        # Iterative Supertrend — tighten bands and flip direction on close cross
+        st = np.zeros(n, dtype=float)
+        direction = np.zeros(n, dtype=int)   # +1 = BUY, -1 = SELL
+        st[period - 1] = upper[period - 1]
+        direction[period - 1] = -1
+        for i in range(period, n):
+            prev_st = st[i - 1]
+            prev_dir = direction[i - 1]
+            # Tighten lower band upward (BUY mode) or upper band downward (SELL mode)
+            lower[i] = max(lower[i], lower[i - 1]) if lower[i] < lower[i - 1] else lower[i]
+            upper[i] = min(upper[i], upper[i - 1]) if upper[i] > upper[i - 1] else upper[i]
+            if prev_dir == -1 and c[i] > prev_st:
+                direction[i] = 1
+                st[i] = lower[i]
+            elif prev_dir == 1 and c[i] < prev_st:
+                direction[i] = -1
+                st[i] = upper[i]
+            else:
+                direction[i] = prev_dir
+                st[i] = lower[i] if prev_dir == 1 else upper[i]
+        return ("BUY" if direction[-1] == 1 else "SELL", round(float(st[-1]), 2))
+    except Exception:
+        return ("N/A", 0.0)
+
+
 def _compute_indicator_snapshot(ohlcv: pd.DataFrame) -> dict[str, Any]:
     """Compute a technical indicator snapshot from the last bar of OHLCV."""
     snap: dict[str, Any] = {}
@@ -370,6 +421,14 @@ def _compute_indicator_snapshot(ohlcv: pd.DataFrame) -> dict[str, Any]:
             except Exception:
                 pass
 
+        # Supertrend (ATR-based trend filter, period=14 multiplier=3)
+        try:
+            st_signal, st_value = _compute_supertrend(high, low, close, period=14, multiplier=3.0)
+            snap["supertrend_signal"] = st_signal
+            snap["supertrend_value"] = st_value
+        except Exception:
+            pass
+
         # Historical Volatility — annualised log-return std (no volume needed)
         try:
             log_rets = np.log(close / close.shift(1)).dropna()
@@ -381,6 +440,92 @@ def _compute_indicator_snapshot(ohlcv: pd.DataFrame) -> dict[str, Any]:
                 snap["hvol_20"] = round(
                     float(log_rets.tail(20).std() * (252 ** 0.5) * 100), 2
                 )
+        except Exception:
+            pass
+
+        # Candlestick pattern recognition — last completed bar
+        try:
+            if bool(_policy("candlestick_patterns_enabled")):
+                valid_bars = ohlcv[ohlcv["high"].astype(float) > 0]
+                if len(valid_bars) >= 2:
+                    last = valid_bars.iloc[-2]
+                    o_c, h_c, l_c, c_c = (
+                        float(last["open"]), float(last["high"]),
+                        float(last["low"]), float(last["close"]),
+                    )
+                    rng = h_c - l_c
+                    body = abs(c_c - o_c)
+                    body_pct = body / rng if rng > 0 else 0
+                    upper_wick = h_c - max(o_c, c_c)
+                    lower_wick = min(o_c, c_c) - l_c
+                    is_bull = c_c > o_c
+
+                    snap["candle_body_pct"] = round(body_pct, 3)
+                    patterns: list[str] = []
+
+                    if body_pct < 0.10 and rng > 0:
+                        patterns.append("doji")
+                    if body_pct > 0.85:
+                        patterns.append("bull_marubozu" if is_bull else "bear_marubozu")
+                    if is_bull and lower_wick > 2 * body and upper_wick < body and rng > 0:
+                        patterns.append("hammer")
+                    if not is_bull and upper_wick > 2 * body and lower_wick < body and rng > 0:
+                        patterns.append("shooting_star")
+                    if len(valid_bars) >= 3:
+                        prev_bar = valid_bars.iloc[-3]
+                        p_o, p_c = float(prev_bar["open"]), float(prev_bar["close"])
+                        if p_c < p_o and is_bull and o_c < p_c and c_c > p_o:
+                            patterns.append("bull_engulfing")
+                        elif p_c > p_o and not is_bull and o_c > p_c and c_c < p_o:
+                            patterns.append("bear_engulfing")
+
+                    snap["candle_patterns"] = patterns if patterns else ["none"]
+        except Exception:
+            pass
+
+        # Fibonacci retracements — last 50 bars
+        try:
+            if bool(_policy("fibonacci_enabled")):
+                lookback = min(50, n)
+                recent = ohlcv.iloc[-lookback:]
+                swing_high = float(recent["high"].astype(float).max())
+                swing_low = float(recent["low"].astype(float).min())
+                swing_range = swing_high - swing_low
+                if swing_range > 0:
+                    cp = float(close.iloc[-1])
+                    fib_levels: dict[str, float] = {
+                        "fib_236": round(swing_high - 0.236 * swing_range, 2),
+                        "fib_382": round(swing_high - 0.382 * swing_range, 2),
+                        "fib_500": round(swing_high - 0.500 * swing_range, 2),
+                        "fib_618": round(swing_high - 0.618 * swing_range, 2),
+                        "fib_786": round(swing_high - 0.786 * swing_range, 2),
+                    }
+                    snap.update(fib_levels)
+                    snap["fib_swing_high"] = round(swing_high, 2)
+                    snap["fib_swing_low"] = round(swing_low, 2)
+                    nearest_key = min(fib_levels, key=lambda k: abs(fib_levels[k] - cp))
+                    nearest_val = fib_levels[nearest_key]
+                    snap["fib_nearest"] = nearest_key.replace("fib_", "")
+                    snap["fib_nearest_val"] = nearest_val
+                    snap["fib_nearest_dist"] = round(abs(cp - nearest_val), 2)
+        except Exception:
+            pass
+
+        # 15-minute resampled indicators
+        try:
+            if bool(_policy("higher_tf_indicators_enabled")):
+                ohlcv_15m = ohlcv.resample("15min").agg({
+                    "open": "first", "high": "max", "low": "min",
+                    "close": "last", "volume": "sum",
+                }).dropna(subset=["close"])
+                close_15m = ohlcv_15m["close"].astype(float)
+                n_15m = len(close_15m)
+                if n_15m >= 15:
+                    snap["rsi_14_15m"] = _last(ta.momentum.rsi(close_15m, window=14))
+                if n_15m >= 9:
+                    snap["ema_9_15m"] = _last(ta.trend.ema_indicator(close_15m, window=9))
+                if n_15m >= 20:
+                    snap["ema_20_15m"] = _last(ta.trend.ema_indicator(close_15m, window=20))
         except Exception:
             pass
 
@@ -803,14 +948,17 @@ PRICE DATA:
 - Day Change: {day_change_pct}% | Gap: {gap_pct}%
 - Prev Close Position in Range: {prev_close_position} (top/mid/bottom quartile)
 - Prev Day Range: {prev_range} pts | vs ATR: {range_vs_atr} (squeeze/normal/expansion)
+- Today Range Position: {day_range_position} (upper_quartile/upper_half/lower_half/lower_quartile) | From High: {dist_from_day_high_pct}% | From Low: {dist_from_day_low_pct}%
 
 TREND INDICATORS:
 - EMA 9: {ema_9} | EMA 20: {ema_20} | EMA 50: {ema_50}
 - EMA 20 vs 50 Slope: {ema_slope} (widening/narrowing/crossed)
-- Supertrend: {supertrend_signal} (buy/sell)
+- Supertrend: {supertrend_signal} (buy/sell) | Band: {supertrend_value}
+- [15M] EMA 9: {ema_9_15m} | [15M] EMA 20: {ema_20_15m}
 
 MOMENTUM:
-- RSI(14): {rsi_14} | Stochastic %K: {stoch_k} | %D: {stoch_d}
+- RSI(14): {rsi_14} | [15M] RSI(14): {rsi_14_15m}
+- Stochastic %K: {stoch_k} | %D: {stoch_d}
 - MACD: {macd} | Signal: {macd_signal} | Histogram: {macd_histogram}
 - MACD Histogram Direction: {macd_hist_direction} (growing/shrinking)
 - Williams %R: {williams_r}
@@ -836,6 +984,15 @@ LEVELS:
 - PDH (Prev Day High): {prev_high} | PDL (Prev Day Low): {prev_low}
 - CPR (Central Pivot Range): {cpr_high} — {cpr_low} | Width: {cpr_width} (narrow/wide)
 
+FIBONACCI (last 50 bars):
+- Swing High: {fib_swing_high} | Swing Low: {fib_swing_low}
+- 23.6%: {fib_236} | 38.2%: {fib_382} | 50%: {fib_500} | 61.8%: {fib_618} | 78.6%: {fib_786}
+- Nearest Level: {fib_nearest} @ {fib_nearest_val} | Distance: {fib_nearest_dist} pts
+
+OPENING RANGE BREAKOUT (9:15–9:30 IST):
+- ORB High: {orb_high} | ORB Low: {orb_low}
+- ORB Status: {orb_status} (ORB_ABOVE/ORB_BELOW/ORB_INSIDE)
+
 ═══════════════════════════════════════════════════════
 OPTIONS FLOW
 ═══════════════════════════════════════════════════════
@@ -849,6 +1006,7 @@ OPTIONS FLOW
 - OI-based Range: {put_wall} (floor) — {call_wall} (ceiling)
 - ATM Call IV: {iv_call}% | ATM Put IV: {iv_put}% | IV Skew: {iv_skew}
 - ATM Premium (CE): ₹{atm_ce_premium} | ATM Premium (PE): ₹{atm_pe_premium}
+- GEX Regime: {gex_regime} (POSITIVE=range-bound / NEUTRAL / NEGATIVE=trending) | ATM OI Concentration: {atm_oi_concentration_pct}%
 - Gamma (ATM): {gamma_atm}
 - Theta per Hour (ATM): ₹{theta_per_hour}
 - IV Drop Since Open: {iv_drop_since_open}%
@@ -896,6 +1054,9 @@ MULTI-TIMEFRAME:
 LAST 5 COMPLETED CANDLES (5-min, newest first):
 {last_5_candles}
 
+CANDLESTICK PATTERN (last completed bar):
+- Pattern: {candle_patterns} | Body Ratio: {candle_body_pct}
+
 ═══════════════════════════════════════════════════════
 POST-AI GUARDRAILS — READ BEFORE ANSWERING
 ═══════════════════════════════════════════════════════
@@ -936,19 +1097,19 @@ chain, global cues) flip an otherwise clean local setup into HOLD.
 CORE ANALYSIS (Factors 1-10)
 ───────────────────────────────────────────────────────
 
-1. TREND: EMA 20 vs 50 — bullish (20>50), bearish (20<50), or mixed (within 0.1%)? Is the gap widening (strengthening) or narrowing (weakening)? Also check if Supertrend agrees.
+1. TREND: EMA 20 vs 50 — bullish (20>50), bearish (20<50), or mixed (within 0.1%)? Is the gap widening (strengthening) or narrowing (weakening)? Also check Supertrend: if signal agrees with EMA bias = strong ✓; if they disagree = ✗. The Supertrend band value ({supertrend_value}) acts as a dynamic support (BUY mode) or resistance (SELL mode) level.
 
 2. MOMENTUM: RSI zone — overbought (>70), buy zone (55-70), neutral (45-55), sell zone (30-45), oversold (<30)? Check Stochastic for crossover confirmation. Check Williams %R for extreme readings.
 
-3. VWAP POSITION: Price above VWAP = institutional buying, below = selling. If within 0.1% of VWAP = no-trade zone. How far from VWAP determines conviction — farther = stronger signal.
+3. VWAP POSITION: Price above VWAP = institutional buying bias, below = selling bias. If within 0.1% of VWAP = no-trade zone. CRITICAL: VWAP is only a meaningful near-term support/resistance when price is WITHIN 0.3% of it. If price is more than 0.5% away from VWAP, do NOT cite VWAP as "holding support" or "acting as resistance" — at that distance it is simply a session average and carries no immediate support/resistance value. Check step2_vwap.diff_pct in the checklist: if diff_pct > 0.5, treat VWAP as neutral (—) for this factor.
 
-4. CANDLE PATTERN: Last 5 candles — higher highs/higher lows (bullish) or lower highs/lower lows (bearish)? Any reversal patterns: doji at resistance, hammer at support, engulfing candle, morning/evening star?
+4. CANDLE PATTERN: Check `candle_patterns` in snapshot (computed from last completed bar): doji = indecision/pause; hammer at support = bullish reversal ✓; shooting_star at resistance = bearish reversal ✓; bull_engulfing = strong bullish reversal ✓; bear_engulfing = strong bearish reversal ✓; bull/bear_marubozu = momentum continuation. Then read the last 5 candles for higher highs/higher lows (bullish) or lower highs/lower lows (bearish). A bull_engulfing or hammer at S1/Fib support with above-average volume is a high-conviction ✓; a doji at R1 is ✗ for BUY; "none" = neutral —.
 
 5. PCR & OPTIONS FLOW: PCR >1.2 = bullish (put writers confident), <0.8 = bearish, 0.8-1.2 = neutral. Is PCR rising (getting more bullish) or falling? Where is max pain relative to spot — is spot being pulled toward it?
 
 6. VOLATILITY: VIX rising = expect bigger move, VIX falling = expect range. Bollinger squeeze (narrow width) = expansion imminent. Use ATR to determine realistic SL and target distances.
 
-7. SUPPORT/RESISTANCE: Is price near any level (S1, S2, R1, R2, PDH, PDL, pivot)? Bounce off support = buy signal. Rejection at resistance = sell. Break through with volume = trend continuation.
+7. SUPPORT/RESISTANCE: Is price near any level (S1, S2, R1, R2, PDH, PDL, pivot)? Bounce off support = buy signal. Rejection at resistance = sell. Break through with volume = trend continuation. FIBONACCI: Check fib_nearest and fib_nearest_dist — price within 0.3% of a Fib level is a potential bounce/rejection zone; 38.2% and 61.8% are the strongest confluence points. OI concentration at a Fib level amplifies its significance. ORB: ORB_ABOVE = bullish day bias ✓; ORB_BELOW = bearish day bias ✓; ORB_INSIDE = no directional edge yet — wait for breakout. DAY RANGE POSITION: `day_range_position` tells where spot sits in today's high-low range — upper_quartile near resistance = sell-lean; lower_quartile near support = buy-lean; range position confirming the directional trade adds ✓; opposing it (e.g. BUY when already in upper_quartile near a wall) adds ✗.
 
 8. TIME OF DAY:
    - 9:15-9:30 = opening noise, AVOID.
@@ -967,11 +1128,11 @@ ADVANCED ANALYSIS (Factors 11-21)
 
 11. OI BUILDUP AT KEY STRIKES: Heavy Call OI at a strike = resistance wall. Heavy Put OI = support floor. If OI is unwinding (decreasing) at a level while price pushes through = real breakout. If OI is increasing while price pushes through = trap, will reverse.
 
-12. GAMMA EXPOSURE: Heavy OI clustered near spot = positive gamma = market makers hedge by selling rallies/buying dips = range-bound day. OI far from spot = negative gamma = moves get amplified = trending day. This determines if you should trade breakouts or mean-reversion.
+12. GAMMA EXPOSURE: Use `gex_regime` — POSITIVE (atm_oi_concentration_pct > 40%): heavy OI near spot → market makers hedge into the range → mean-reversion day (fade breakouts, buy dips/sell spikes near walls). NEGATIVE (< 20%): OI spread far from spot → moves amplified → trending day (trade breakouts with momentum). NEUTRAL: no strong gamma tilt. Cross-check with the call_wall/put_wall: if gex_regime=POSITIVE and spot is within 100 pts of the call wall, lean SELL or HOLD at that wall.
 
 13. IV SKEW: Put IV >> Call IV = fear premium, market expects downside. Call IV rising suddenly = someone buying upside aggressively. IV crush (both dropping) = move exhausted, range ahead. IV skew shifts often precede actual price moves by 5-15 minutes.
 
-14. GLOBAL CONTEXT: Does SGX Nifty / US futures / Asian market direction support or oppose the local Bank Nifty setup? A locally bullish setup with global bearish context = reduce confidence by 10.
+14. GLOBAL CONTEXT: Does SGX Nifty / US futures / Asian market direction support or oppose the local Bank Nifty setup? A locally bullish setup with global bearish context = reduce confidence by 10. NOTE ON NEWS SENTIMENT: News/macro sentiment is a slow-moving backdrop, not a timing signal. Do NOT use "bullish news sentiment" as a confirming ✓ factor for an intraday BUY — it cannot predict what BANKNIFTY does in the next 15 minutes. Bullish news only marginally reduces the bar for an already-valid setup; it does NOT add a ✓ to the factor count. If global cues are all N/A, treat this factor as — (neutral).
 
 15. FII POSITIONING: FII long/short ratio >1.5 = institutional bullish backing. <0.7 = bearish pressure. Sudden overnight change = possible regime shift.
 
@@ -986,6 +1147,7 @@ ADVANCED ANALYSIS (Factors 11-21)
     - 5m agrees with 15m but 1m diverges → moderate, timing issue.
     - 5m disagrees with 15m → LOW conviction, reduce size.
     - All three diverge → HOLD.
+    - CHECK [15M] RSI and EMA from snapshot: if [15M] RSI < 45 while 5m RSI > 55, the higher timeframe opposes momentum — this is a significant conflict; cap confidence at 60% and treat as ✗ for Factor 17. If [15M] EMA 9 < [15M] EMA 20 while 5m EMA 9 > 5m EMA 20 = bearish 15m trend overriding 5m bullish signal.
 
 18. PREV DAY STRUCTURE:
     - Closed in top 25% of range → bullish carry-over.
@@ -1134,6 +1296,12 @@ MARKET CONDITION RULES:
 9. Global cues strongly oppose local setup → reduce confidence by 10.
 10. Event within 30 minutes → HOLD regardless of all signals.
 
+SELF-CONSISTENCY RULES (prevent contradictory reasoning):
+11. If your analysis identifies a SIDEWAYS or conflicting regime on the 15m timeframe, confidence MUST NOT exceed 62%. A sideways higher timeframe fundamentally limits the probability of a sustained directional move.
+12. If you write ANY phrase like "sideways", "choppy", "mixed signals", "conflicting", "uncertain", or "limited follow-through" in your reasoning, you MUST reflect that uncertainty by capping confidence at 65% maximum. High confidence + acknowledged conflict = bad calibration.
+13. EMA stack (EMA9>EMA20>EMA50) + RSI in buy zone + price above VWAP are all MOMENTUM indicators that are correlated — they represent 3-4 factors, not 10. Do NOT treat them as independent confirmations. A bullish EMA stack with RSI in buy zone alone cannot justify confidence above 65% without options flow or multi-timeframe confirmation.
+14. Before citing S1/R1 as "holding support/resistance", verify from the last 5 candles that price actually approached and bounced from that level today. If price never tested S1 today, it is not "holding" — cite it as a reference level only (neutral —).
+
 BREAKOUT RULES:
 11. Never enter on unclosed breakout candle. Wait for close.
 12. Breakout volume < 1.5x avg → classify as fake → HOLD.
@@ -1164,18 +1332,25 @@ MAGNITUDE & VOLATILITY:
 CONFIDENCE CALIBRATION
 ═══════════════════════════════════════════════════════
 
-NON-EXPIRY DAYS:
-- 90-100%: 30+ of 37 factors aligned + breakout with 2x volume + all TFs agree (1-2x per week max)
-- 80-89%: 25-29 factors + strong trend + good volume + options flow confirms
-- 70-79%: 20-24 factors + clear direction + moderate volume
-- 65-69%: 17-19 factors + some conflicts but majority agrees
-- Below {min_confidence}%: Insufficient → MUST output HOLD
+Use the FULL range from 30% to 100%. Do NOT cluster all predictions at 70–75%. Each tier below represents a genuinely different signal quality — calibrate honestly.
 
-EXPIRY DAYS:
-- 85-100%: 28+ factors + strong gap + 2x volume + trend by 10 AM (very rare)
-- 75-84%: 23-27 factors + direction clear + healthy premium + before 12 PM
-- 65-74%: 18-22 factors + moderate conviction + must be before 11:30 AM for buyers
-- Below {min_confidence}%: HOLD. Marginal setups lose to theta + gamma on expiry.
+NON-EXPIRY DAYS:
+- 90-100%: 30+ of 37 factors aligned + breakout with 2x volume + all TFs agree + options flow strongly confirms (1-2x per week max — be very selective)
+- 80-89%: 25-29 factors + strong trend + volume confirms + options OI/PCR agree + no conflicting signals
+- 70-79%: 20-24 factors + clear direction + at least one options flow signal confirms + 5m and 15m aligned
+- 60-69%: 15-19 factors + majority agrees but 1-2 meaningful conflicts present + VWAP near or options chain weak
+- 50-59%: 10-14 factors aligned + sideways or uncertain higher TF + limited options confirmation + lean setup with real risks
+- 30-49%: Weak setup, <10 factors, significant conflicts — output HOLD unless in a clearly defined range-trade opportunity
+- Below 30%: HOLD always
+
+EXPIRY DAYS (these are harder to trade — calibrate lower):
+- 85-100%: 28+ factors + strong gap + 2x volume + trend established by 10 AM (very rare)
+- 75-84%: 23-27 factors + direction clear + healthy premium + before 12 PM + no major conflicts
+- 65-74%: 18-22 factors + moderate conviction + before 11:30 AM for buyers only
+- 50-64%: Weak expiry setup — HOLD unless selling premium or max pain play is obvious
+- Below 50%: HOLD. Theta + gamma on expiry punishes marginal setups severely.
+
+IMPORTANT: If most of your confirming factors are just momentum indicators (EMA stack, RSI, MACD all saying the same thing), your effective independent factor count is lower than it appears. Momentum indicators move together — treat an aligned EMA+RSI+MACD cluster as 3 factors total, not 3 separate confirmations counting toward the 37.
 
 ═══════════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -1196,12 +1371,14 @@ REASON format — single sentence citing:
   - If expiry: mention expiry-specific factor
   - If HOLD: state the 1-2 reasons blocking the trade
 
-Examples:
-  "BUY: EMA20>50 widening + RSI 63 buy zone + price 0.4% above VWAP with 2.1x volume + put OI floor at 51000 holding. Breakout score 5/7."
-  "SELL: Bearish engulfing at R1 + RSI 38 sell zone + PCR 0.72 bearish + FII net short. IV skew confirms downside expectation."
-  "HOLD: RSI neutral (48.2) in no-trade zone + volume only 0.6x avg + conflicting timeframes (5m bullish, 15m bearish). Only 3/10 core signals aligned."
+Examples (note the RANGE of confidence values — do not cluster everything at 70-75%):
+  "BUY: EMA20>50 widening + RSI 63 buy zone + PCR 1.35 rising + put OI floor at 51000 tested and held + 5m/15m aligned UPTREND. Breakout score 5/7." [confidence: 82]
+  "BUY: EMA stack bullish + RSI 58 + price 0.2% above VWAP + S1 tested and bounced + options chain N/A. 15m SIDEWAYS limits conviction." [confidence: 57]
+  "SELL: Bearish engulfing at R1 (tested twice today) + RSI 38 sell zone + PCR 0.72 bearish + 5m/15m both DOWNTREND. IV skew confirms downside." [confidence: 78]
+  "HOLD: RSI neutral (48.2) in no-trade zone + volume only 0.6x avg + conflicting timeframes (5m bullish, 15m bearish) — self-consistency rule 11 applies. Only 3 independent signals aligned."
+  "HOLD: EMA bullish + RSI 61 buy zone — but 15m regime is SIDEWAYS, VWAP is 1.2% below entry (not immediate support), and no options flow data. Momentum-only setup, insufficient independent confirmation."
   "HOLD: FAKE breakout above 52000 (score 2/7) — volume 0.9x avg + RSI divergence + call OI increasing at strike. Waiting for retest."
-  "SELL (FADE): Failed breakout above 52000 returned in 8 min. Volume trap + OI adding. Fading with SL above 52050. WEEKLY EXPIRY — half size."\
+  "SELL (FADE): Failed breakout above 52000 returned in 8 min. Volume trap + OI adding. Fading with SL above 52050. WEEKLY EXPIRY — half size." [confidence: 71]\
 """
 
 
@@ -1346,6 +1523,11 @@ class _PredictionPolicyStore:
         "trend_guardrail_enabled": "gemini_trend_guardrail_enabled",
         "reversal_confirmation_min_signals": "gemini_reversal_confirmation_min_signals",
         "volume_confirmation_min_ratio": "gemini_volume_confirmation_min_ratio",
+        "candlestick_patterns_enabled": "gemini_candlestick_patterns_enabled",
+        "fibonacci_enabled": "gemini_fibonacci_enabled",
+        "orb_enabled": "gemini_orb_enabled",
+        "higher_tf_indicators_enabled": "gemini_higher_tf_indicators_enabled",
+        "consensus_enabled": "gemini_consensus_enabled",
     }
 
     _CAMEL: dict[str, str] = {
@@ -1360,6 +1542,11 @@ class _PredictionPolicyStore:
         "trend_guardrail_enabled": "trendGuardrailEnabled",
         "reversal_confirmation_min_signals": "reversalConfirmationMinSignals",
         "volume_confirmation_min_ratio": "volumeConfirmationMinRatio",
+        "candlestick_patterns_enabled": "candlestickPatternsEnabled",
+        "fibonacci_enabled": "fibonacciEnabled",
+        "orb_enabled": "orbEnabled",
+        "higher_tf_indicators_enabled": "higherTfIndicatorsEnabled",
+        "consensus_enabled": "consensusEnabled",
     }
 
     @classmethod
@@ -1378,7 +1565,9 @@ class _PredictionPolicyStore:
                 continue
             if k in ("rate_limit_max_retries", "reversal_confirmation_min_signals"):
                 v = int(v)
-            elif k == "trend_guardrail_enabled":
+            elif k in ("trend_guardrail_enabled", "candlestick_patterns_enabled",
+                       "fibonacci_enabled", "orb_enabled", "higher_tf_indicators_enabled",
+                       "consensus_enabled"):
                 if isinstance(v, str):
                     v = v.strip().lower() in ("1", "true", "yes", "on")
                 else:
@@ -1409,6 +1598,52 @@ class _PredictionPolicyStore:
 
 def _policy(key: str) -> Any:
     return _PredictionPolicyStore.get(key)
+
+
+def _merge_consensus(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+    """Merge two model predictions into a consensus result.
+
+    Same direction → keep primary's levels, use the lower (more conservative) confidence.
+    Different direction → force HOLD; neither model has a conviction edge.
+    If one model errored (empty dict or no direction) → fall back to the other.
+    """
+    p_dir = primary.get("direction", "HOLD")
+    s_dir = secondary.get("direction", "HOLD")
+    p_conf = float(primary.get("confidence") or 0)
+    s_conf = float(secondary.get("confidence") or 0)
+
+    p_model = primary.get("ai_model") or "gemini"
+    s_model = secondary.get("ai_model") or "openai"
+
+    if p_dir == s_dir:
+        result = primary.copy()
+        result["confidence"] = round(min(p_conf, s_conf), 1)
+        orig_reason = str(primary.get("prediction_reason") or "")
+        result["prediction_reason"] = (
+            f"[CONSENSUS ✓ {p_dir}] {p_model}({p_conf:.0f}%) + "
+            f"{s_model}({s_conf:.0f}%) agree. {orig_reason}"
+        )
+        result["ai_tool"] = "CONSENSUS"
+        logger.info(
+            f"Consensus AGREE: both={p_dir} conf=min({p_conf:.0f},{s_conf:.0f})"
+            f"→{result['confidence']:.0f}%"
+        )
+        return result
+
+    result = primary.copy()
+    result["direction"] = "HOLD"
+    result["magnitude"] = 0.0
+    result["confidence"] = 0.0
+    result["prediction_reason"] = (
+        f"[CONSENSUS ✗ HOLD] Models disagree: {p_model}={p_dir}({p_conf:.0f}%) vs "
+        f"{s_model}={s_dir}({s_conf:.0f}%). Holding to avoid false signal."
+    )
+    result["ai_tool"] = "CONSENSUS"
+    logger.info(
+        f"Consensus DISAGREE: {p_model}={p_dir}({p_conf:.0f}%) vs "
+        f"{s_model}={s_dir}({s_conf:.0f}%) → HOLD"
+    )
+    return result
 
 
 class _SafeDict(dict):
@@ -1484,6 +1719,28 @@ def _compute_options_summary(options_chain: pd.DataFrame, spot: float) -> dict:
         max_pain_distance = round(float(max_pain) - spot, 2) if max_pain and spot else 0.0
         max_pain_distance_pct = round(max_pain_distance / spot * 100, 2) if spot else 0.0
 
+        # GEX proxy — OI concentration within 1% of spot
+        # POSITIVE (>40% of OI near spot) → range-bound day; NEGATIVE (<20%) → trending day.
+        gex_regime: Any = "N/A"
+        atm_oi_concentration_pct: Any = "N/A"
+        try:
+            if spot > 0:
+                atm_band = spot * 0.01
+                atm_mask = abs(options_chain["strike"].astype(float) - spot) <= atm_band
+                atm_oi = float(options_chain[atm_mask]["call_oi"].sum()) + float(options_chain[atm_mask]["put_oi"].sum())
+                total_oi = float(options_chain["call_oi"].sum()) + float(options_chain["put_oi"].sum())
+                if total_oi > 0:
+                    concentration = atm_oi / total_oi
+                    atm_oi_concentration_pct = round(concentration * 100, 1)
+                    if concentration > 0.40:
+                        gex_regime = "POSITIVE"
+                    elif concentration < 0.20:
+                        gex_regime = "NEGATIVE"
+                    else:
+                        gex_regime = "NEUTRAL"
+        except Exception:
+            pass
+
         return {
             **pcr,
             "max_pain": max_pain,
@@ -1501,6 +1758,8 @@ def _compute_options_summary(options_chain: pd.DataFrame, spot: float) -> dict:
             "atm_ce_premium": atm_call_ltp,
             "atm_pe_premium": atm_put_ltp,
             "atm_strike": atm_strike,
+            "gex_regime": gex_regime,
+            "atm_oi_concentration_pct": atm_oi_concentration_pct,
         }
     except Exception as e:
         logger.warning("Options summary computation failed: {}", e)
@@ -1562,6 +1821,53 @@ def _build_snapshot_context(
         today_low = float(today_df["low"].min())
     else:
         today_open = today_high = today_low = spot
+
+    # Intraday range position — where is spot relative to today's high/low?
+    day_range_position: Any = "N/A"
+    dist_from_day_high_pct: Any = "N/A"
+    dist_from_day_low_pct: Any = "N/A"
+    if not today_df.empty and spot > 0:
+        try:
+            day_range = today_high - today_low
+            if day_range > 0:
+                ratio = (spot - today_low) / day_range
+                if ratio >= 0.75:
+                    day_range_position = "upper_quartile"
+                elif ratio >= 0.50:
+                    day_range_position = "upper_half"
+                elif ratio >= 0.25:
+                    day_range_position = "lower_half"
+                else:
+                    day_range_position = "lower_quartile"
+                dist_from_day_high_pct = round((today_high - spot) / spot * 100, 2)
+                dist_from_day_low_pct = round((spot - today_low) / spot * 100, 2)
+        except Exception:
+            pass
+
+    # ── Opening Range Breakout (ORB) — bars in 9:15–9:30 IST window ────────
+    orb_high: Any = "N/A"
+    orb_low: Any = "N/A"
+    orb_status: Any = "N/A"
+    try:
+        if bool(_policy("orb_enabled")) and not today_df.empty:
+            orb_idx = today_df.index
+            if getattr(orb_idx, "tz", None) is None:
+                orb_idx_ist = orb_idx.tz_localize("UTC").tz_convert(IST)
+            else:
+                orb_idx_ist = orb_idx.tz_convert(IST)
+            orb_mask = [(d.hour == 9 and 15 <= d.minute < 30) for d in orb_idx_ist]
+            orb_df = today_df[orb_mask]
+            if not orb_df.empty:
+                orb_high = round(float(orb_df["high"].astype(float).max()), 2)
+                orb_low = round(float(orb_df["low"].astype(float).min()), 2)
+                if spot > orb_high:
+                    orb_status = "ORB_ABOVE"
+                elif spot < orb_low:
+                    orb_status = "ORB_BELOW"
+                else:
+                    orb_status = "ORB_INSIDE"
+    except Exception:
+        pass
 
     if not prev_df.empty:
         prev_high = float(prev_df["high"].max())
@@ -1768,6 +2074,10 @@ def _build_snapshot_context(
         "prev_close_position": prev_close_position,
         "prev_range":    _fmt(prev_range),
         "range_vs_atr":  range_vs_atr,
+        # Intraday range position
+        "day_range_position":     day_range_position,
+        "dist_from_day_high_pct": _fmt(dist_from_day_high_pct) if isinstance(dist_from_day_high_pct, (int, float)) else dist_from_day_high_pct,
+        "dist_from_day_low_pct":  _fmt(dist_from_day_low_pct) if isinstance(dist_from_day_low_pct, (int, float)) else dist_from_day_low_pct,
         # EMAs
         "ema_9":         _fmt(indicators.get("ema_9")),
         "ema_20":        _fmt(ema_20),
@@ -1828,6 +2138,9 @@ def _build_snapshot_context(
         "iv_skew":               _fmt(ops.get("iv_skew"), 2),
         "atm_ce_premium":        _fmt(ops.get("atm_ce_premium")),
         "atm_pe_premium":        _fmt(ops.get("atm_pe_premium")),
+        # GEX proxy from OI concentration
+        "gex_regime":                ops.get("gex_regime") or "N/A",
+        "atm_oi_concentration_pct":  _fmt(ops.get("atm_oi_concentration_pct"), 1),
         # Options flow snapshot-comparison fields (not yet available — require two snapshots)
         "pcr_open":              "N/A",
         "pcr_direction":         "N/A",
@@ -1837,8 +2150,9 @@ def _build_snapshot_context(
         "put_oi_change":         "N/A",
         "gamma_atm":             "N/A",
         "theta_per_hour":        "N/A",
-        # Indicators not yet computable from index OHLCV
-        "supertrend_signal":     "N/A",
+        # Supertrend (computed from OHLCV)
+        "supertrend_signal":     indicators.get("supertrend_signal") or "N/A",
+        "supertrend_value":      _fmt(indicators.get("supertrend_value")),
         # Calendar
         "market_phase":  market_phase,
         "time_ist":      now_ist.strftime("%H:%M IST"),
@@ -1851,6 +2165,28 @@ def _build_snapshot_context(
         "aligned_direction":     aligned_direction,
         # Tail
         "last_5_candles": last_5_candles,
+        # Candlestick patterns
+        "candle_patterns": ", ".join(indicators.get("candle_patterns") or ["none"]),
+        "candle_body_pct": _fmt(indicators.get("candle_body_pct")),
+        # Fibonacci retracements (last 50-bar swing)
+        "fib_236":          _fmt(indicators.get("fib_236")),
+        "fib_382":          _fmt(indicators.get("fib_382")),
+        "fib_500":          _fmt(indicators.get("fib_500")),
+        "fib_618":          _fmt(indicators.get("fib_618")),
+        "fib_786":          _fmt(indicators.get("fib_786")),
+        "fib_swing_high":   _fmt(indicators.get("fib_swing_high")),
+        "fib_swing_low":    _fmt(indicators.get("fib_swing_low")),
+        "fib_nearest":      indicators.get("fib_nearest") or "N/A",
+        "fib_nearest_val":  _fmt(indicators.get("fib_nearest_val")),
+        "fib_nearest_dist": _fmt(indicators.get("fib_nearest_dist")),
+        # Opening Range Breakout
+        "orb_high":   _fmt(orb_high) if isinstance(orb_high, (int, float)) else orb_high,
+        "orb_low":    _fmt(orb_low) if isinstance(orb_low, (int, float)) else orb_low,
+        "orb_status": orb_status,
+        # 15-minute resampled indicators
+        "rsi_14_15m": _fmt(indicators.get("rsi_14_15m"), 1),
+        "ema_9_15m":  _fmt(indicators.get("ema_9_15m")),
+        "ema_20_15m": _fmt(indicators.get("ema_20_15m")),
         # Policy
         "target_minutes":  target_minutes,
         "min_confidence":  _policy("min_confidence"),

@@ -9,9 +9,10 @@ from loguru import logger
 from app.config import settings
 from app.grpc_server.proto_market import ohlcv_bars_to_dataframe, options_chain_to_dataframe, vix_points_to_dataframe
 from app.grpc_server.live_tick_buffer import get_live_tick_buffer, live_tick_routing_key
-from app.inference.gemini_predictor import GeminiPredictor
+from app.inference.gemini_predictor import GeminiPredictor, _merge_consensus, _policy
 
 _predict_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-predict")
+_consensus_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="consensus")
 
 _ML_UNAVAILABLE_MSG = (
     "ML prediction pipeline is not available (ML packages not installed). "
@@ -56,6 +57,14 @@ class PredictionServicer:
         self.predictor = _try_import_predictor()
         self.gemini_predictor = GeminiPredictor()
         self.backtest_engine = _try_import_backtest()
+        self._openai_predictor = None  # lazy — only instantiated when consensus is first needed
+
+    def _get_openai_predictor(self):
+        """Lazy-init OpenAI predictor — avoids import cost when consensus is disabled."""
+        if self._openai_predictor is None:
+            from app.inference.openai_predictor import OpenAIPredictor
+            self._openai_predictor = OpenAIPredictor()
+        return self._openai_predictor
 
     def _build_response(self, pb2, horizon: str, result: dict):
         """Build a PredictionResponse proto from a result dict.
@@ -161,14 +170,52 @@ class PredictionServicer:
             )
 
             if engine == "AI":
-                result = self.gemini_predictor.predict(
-                    horizon=request.horizon,
-                    ohlcv=ohlcv,
-                    vix=vix,
-                    sensex_quote=quote,
-                    underlying_symbol=sym,
-                    options_chain=options_chain if not options_chain.empty else None,
-                )
+                from app.config import settings as _s
+                _consensus_on = bool(_policy("consensus_enabled")) and bool(_s.openai_api_key)
+                if _consensus_on:
+                    logger.info(
+                        f"Consensus mode: running Gemini + OpenAI in parallel "
+                        f"(horizon={request.horizon})"
+                    )
+                    loop = asyncio.get_event_loop()
+                    _kwargs = dict(
+                        horizon=request.horizon,
+                        ohlcv=ohlcv,
+                        vix=vix,
+                        sensex_quote=quote,
+                        underlying_symbol=sym,
+                        options_chain=options_chain if not options_chain.empty else None,
+                    )
+                    gem_fut = loop.run_in_executor(
+                        _consensus_executor,
+                        lambda: self.gemini_predictor.predict(**_kwargs),
+                    )
+                    oai_fut = loop.run_in_executor(
+                        _consensus_executor,
+                        lambda: self._get_openai_predictor().predict(**_kwargs),
+                    )
+                    gem_res, oai_res = await asyncio.gather(
+                        gem_fut, oai_fut, return_exceptions=True
+                    )
+                    if isinstance(gem_res, Exception) and isinstance(oai_res, Exception):
+                        raise gem_res
+                    elif isinstance(gem_res, Exception):
+                        logger.warning(f"Consensus: Gemini failed ({gem_res}), using OpenAI only")
+                        result = oai_res
+                    elif isinstance(oai_res, Exception):
+                        logger.warning(f"Consensus: OpenAI failed ({oai_res}), using Gemini only")
+                        result = gem_res
+                    else:
+                        result = _merge_consensus(gem_res, oai_res)
+                else:
+                    result = self.gemini_predictor.predict(
+                        horizon=request.horizon,
+                        ohlcv=ohlcv,
+                        vix=vix,
+                        sensex_quote=quote,
+                        underlying_symbol=sym,
+                        options_chain=options_chain if not options_chain.empty else None,
+                    )
             else:
                 result = self.predictor.predict(
                     horizon=request.horizon,

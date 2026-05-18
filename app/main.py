@@ -384,13 +384,16 @@ def _validate_prediction_policy_patch(p: Dict[str, Any]) -> List[str]:
                 errs.append("rate_limit_retry_base_delay_sec must be 1–120")
         except (TypeError, ValueError):
             errs.append("rate_limit_retry_base_delay_sec must be a number")
-    if "trend_guardrail_enabled" in p:
-        v = p["trend_guardrail_enabled"]
-        if isinstance(v, str):
-            if v.strip().lower() not in ("1", "0", "true", "false", "yes", "no", "on", "off"):
-                errs.append("trend_guardrail_enabled must be a boolean")
-        elif not isinstance(v, (bool, int)):
-            errs.append("trend_guardrail_enabled must be a boolean")
+    for _bool_key in ("trend_guardrail_enabled", "candlestick_patterns_enabled",
+                      "fibonacci_enabled", "orb_enabled", "higher_tf_indicators_enabled",
+                      "consensus_enabled"):
+        if _bool_key in p:
+            v = p[_bool_key]
+            if isinstance(v, str):
+                if v.strip().lower() not in ("1", "0", "true", "false", "yes", "no", "on", "off"):
+                    errs.append(f"{_bool_key} must be a boolean")
+            elif not isinstance(v, (bool, int)):
+                errs.append(f"{_bool_key} must be a boolean")
     if "reversal_confirmation_min_signals" in p:
         try:
             x = int(p["reversal_confirmation_min_signals"])
@@ -763,9 +766,10 @@ async def predict(req: PredictRequest):
 
     # "AI" is the legacy value from older Java backends — treated as GEMINI.
     engine_key = req.engine.upper()
+    use_consensus = engine_key == "CONSENSUS"
     use_gemini = engine_key in ("AI", "GEMINI")
     use_openai = engine_key == "OPENAI"
-    use_ai = use_gemini or use_openai   # intraday bar resolution for AI paths
+    use_ai = use_gemini or use_openai or use_consensus   # intraday bar resolution for AI paths
 
     bars_as_dicts = [b.model_dump() for b in req.sensex_ohlcv]
     ohlcv = ohlcv_bars_to_dataframe(bars_as_dicts, aggregate_daily=not use_ai)
@@ -814,7 +818,27 @@ async def predict(req: PredictRequest):
     )
 
     try:
-        if use_openai:
+        if use_consensus:
+            import asyncio as _asyncio
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            from app.inference.gemini_predictor import GeminiPredictor, _merge_consensus
+            from app.inference.openai_predictor import OpenAIPredictor
+            if not settings.openai_api_key:
+                raise HTTPException(status_code=400, detail="consensus requires openai_api_key to be configured")
+            logger.info(
+                "REST /predict (CONSENSUS): horizon={} bars={} vix={} underlying={!r}",
+                req.horizon, len(ohlcv), len(vix), sym,
+            )
+            _gem = GeminiPredictor()
+            _oai = OpenAIPredictor()
+            with _TPE(max_workers=2) as _pool:
+                _gf = _pool.submit(_gem.predict, **common_kwargs)
+                _of = _pool.submit(_oai.predict, **common_kwargs)
+                _gem_res = _gf.result()
+                _oai_res = _of.result()
+            result = _merge_consensus(_gem_res, _oai_res)
+
+        elif use_openai:
             from app.inference.openai_predictor import OpenAIPredictor
             logger.info(
                 "REST /predict (OPENAI model={}): horizon={} bars={} vix={} "

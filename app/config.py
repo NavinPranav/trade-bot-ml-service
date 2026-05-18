@@ -57,12 +57,12 @@ class Settings(BaseSettings):
 
     # Google Gemini (used by GetGeminiPrediction RPC when prediction_engine=AI)
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-2.5-pro"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
 
     # OpenAI / ChatGPT (used when prediction_engine=OPENAI)
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o"
+    openai_model: str = "o4-mini"
     openai_base_url: str = "https://api.openai.com/v1"
 
     # Post-coercion policy (tune without code changes — env / .env)
@@ -89,6 +89,16 @@ class Settings(BaseSettings):
     # below this ratio. 0.0 = disabled (default — opt-in because thin-tape data
     # quality varies by symbol). Typical opt-in value: 0.7.
     gemini_volume_confirmation_min_ratio: float = 0.0
+
+    # Dual-model consensus: run Gemini + OpenAI in parallel; HOLD on disagreement.
+    # Requires openai_api_key to be set. Default off (opt-in via admin policy API).
+    gemini_consensus_enabled: bool = False
+
+    # Technical analysis feature toggles — all enabled by default; admin can disable via policy API.
+    gemini_candlestick_patterns_enabled: bool = True
+    gemini_fibonacci_enabled: bool = True
+    gemini_orb_enabled: bool = True
+    gemini_higher_tf_indicators_enabled: bool = True
 
     # Live predict: retries on HTTP 429 before HOLD placeholder (same idea as /admin/analyse).
     gemini_429_max_retries: int = 4
